@@ -29,7 +29,7 @@ jobs:
         run: pytest tests/ -v
 
       - name: Run bandit
-        run: bandit -r autoduo/ -ll --exclude .venv
+        run: bandit -r autoduo/ -ll
 
   lint:
     runs-on: ubuntu-latest
@@ -39,7 +39,7 @@ jobs:
       - name: Shellcheck
         run: |
           sudo apt-get install -y shellcheck
-          shellcheck autoduo scripts/*.sh
+          shellcheck scripts/autoduo scripts/install.sh scripts/uninstall.sh
 
       - name: Compile-check
         run: |
