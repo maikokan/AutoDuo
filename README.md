@@ -1,8 +1,8 @@
-# 🚨 autoduo
+# 🚨 AutoDuo
 
 **⚠️ WARNING: This software defeats Duo 2FA by design.**
 
-`autoduo` is a headless Linux daemon that runs 24/7 and automatically
+AutoDuo is a headless Linux daemon that runs 24/7 and automatically
 approves Duo push notifications on your behalf. After a one-time
 enrollment (scan QR / approve on phone once), it handles all future
 push approvals unattended.
@@ -15,7 +15,7 @@ push approvals unattended.
 
 ## ⚠️ Threat Model — Read First
 
-`autoduo` **defeats the entire purpose of Duo 2FA**. Anyone with shell
+AutoDuo **defeats the entire purpose of Duo 2FA**. Anyone with shell
 on this server can approve pushes for the configured account. Use **only**
 on a dedicated VPS that you fully control. You must:
 
@@ -32,13 +32,22 @@ consequences. The authors accept no liability.
 
 ## Quick Start
 
+**One-liner install** (copy and paste):
+
 ```bash
-git clone https://github.com/maikokan/AutoDuo.git /opt/autoduo && sudo ./autoduo setup
+curl -fsSL https://raw.githubusercontent.com/maikokan/AutoDuo/main/install.sh | sudo bash
 ```
 
-It will install dependencies, show a disclaimer, ask for your Duo
-activation URL, enroll a virtual device, start the daemon, and run a
-push-test to verify everything works.
+**Or install manually:**
+
+```bash
+git clone https://github.com/maikokan/AutoDuo.git /opt/autoduo
+cd /opt/autoduo
+sudo ./autoduo setup
+```
+
+AutoDuo installs to `/opt/autoduo/` with vault at `/var/lib/autoduo/`
+and logs at `/var/log/autoduo/`.
 
 ---
 
@@ -63,69 +72,35 @@ All commands require root (`sudo`).
 
 ## How It Works
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        autoduo architecture                          │
-│                                                                      │
-│  ┌─────────────────┐    ┌─────────────────────────────────────────┐  │
-│  │  Duo Admin Panel │───▶│  Enroll (RSA-2048 keypair generated    │  │
-│  │  (Add Device)   │    │  locally, registered via activation API)│  │
-│  └─────────────────┘    └─────────────────────────────────────────┘  │
-│                                     │                                 │
-│                                     ▼                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │  Vault: /var/lib/autoduo/vault.enc                             │  │
-│  │  ── RSA private key    (AES-GCM, PBKDF2 600k rounds)          │  │
-│  │  ── akey, pkey         (Duo's per-device identifiers)          │  │
-│  │  ── app_install_id     (UUID fingerprint)                      │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│                                     │                                 │
-│                                     ▼                                 │
-│  ┌─────────────────────────────────────────────────────────────────┐  │
-│  │  daemon.py  (systemd, Restart=always)                           │  │
-│  │  ── Polls  GET /push/v2/device/transactions  (every 5s)        │  │
-│  │  ── Approve POST .../transactions/<urgid>  (answer=approve)    │  │
-│  │  ── In-process urgid dedup (no double-approve)                │  │
-│  │  ── Circuit breaker on repeated auth failures                  │  │
-│  └─────────────────────────────────────────────────────────────────┘  │
-│                                                                      │
-│  Logs:                                                               │
-│  ── /var/log/autoduo/daemon.log     (events, lifecycle)              │
-│  ── /var/log/autoduo/audit.log      (approved transactions)         │
-│  ── /var/log/autoduo/traffic.log    (opt-in HTTP traffic)           │
-└─────────────────────────────────────────────────────────────────────┘
-```
+Duo has three HTTP APIs:
 
-### The protocol
-
-Duo has three HTTP surfaces:
-
-| Surface | Purpose | Can approve push? |
+| API | What it does | Can approve push? |
 |---|---|---|
-| `/auth/v2/` | End-user REST API | **No** (only sends + polls) |
-| `/admin/v1/` | Admin API | **No** (user management only) |
+| `/auth/v2/` | User auth (send + poll) | **No** |
+| `/admin/v1/` | User management | **No** |
 | `/push/v2/...` | Mobile device protocol | **Yes** |
 
-`autoduo` speaks the third surface — the same protocol as the real
-Duo Mobile Android app. All requests are signed with RSA-SHA512 over
-the device's private key. The key is stored in an AES-GCM encrypted
-vault (PBKDF2-HMAC-SHA256, 600k iterations for offline brute-force
-resistance).
+AutoDuo uses the third API — the same protocol as the real Duo Mobile
+Android app. On enrollment it generates an RSA-2048 keypair, registers
+it with Duo, and stores everything in an encrypted vault
+(AES-GCM, PBKDF2 600k rounds). The daemon then polls for pending
+pushes every 5 seconds and approves them automatically.
+
+No browser automation. No screen scraping. Just the same API calls
+the real app makes.
 
 ---
 
 ## Logging
 
-| Log file | Contents | Sensitivity |
-|---|---|---|
-| `daemon.log` | Lifecycle events, approval successes, errors | Low |
-| `audit.log` | Approved transactions (urgid, app, factor) | Medium (PII redacted) |
-| `traffic.log` | HTTP requests/responses (headers redacted, body SHA-256 only) | High — **opt-in only** |
+| Log | What it contains |
+|---|---|
+| `/var/log/autoduo/daemon.log` | Events, lifecycle, approval success/failure |
+| `/var/log/autoduo/audit.log` | Redacted approval records (urgid, app, factor) |
+| `/var/log/autoduo/traffic.log` | HTTP traffic (opt-in, headers redacted, body SHA-256 only) |
 
-Enable the traffic log via the daemon's `--traffic-log` flag.
-
-`akey` and `pkey` are never logged in full; any log line that might
-contain them shows only `<N chars:hidden>`.
+Sensitive fields (`akey`, `pkey`, authorization headers) are never
+logged in full. The audit log is mode 0640.
 
 ---
 
