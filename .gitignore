@@ -62,4 +62,7 @@ passphrase.txt
 # duo-bot runtime
 /var/
 seen.json
-heartbeat.slim/
+heartbeat
+
+# Development (internal notes, never publish)
+.slim/
