@@ -99,15 +99,17 @@ def seal(
 
     # Write atomically: tmp file in same dir, then rename.
     tmp = p.with_suffix(p.suffix + ".tmp")
-    old_umask = os.umask(0o077)  # so file is created 0600 even if caller umask is wider
     try:
         tmp.write_bytes(blob)
         os.rename(tmp, p)
-    finally:
-        os.umask(old_umask)
-
-    # Belt-and-suspenders: enforce perms in case the rename preserved
-    # an existing mode (it shouldn't, but chmod is cheap).
+    except Exception:
+        # Clean up the temp file on failure
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    # Enforce perms after write (replaces umask trick for thread-safety).
     os.chmod(p, 0o600)
     os.chmod(parent, 0o700)
 

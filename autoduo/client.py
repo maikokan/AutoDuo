@@ -117,7 +117,11 @@ class DeviceClient:
             "pkpush": "rsa-sha512",
         }
         resp = self._request_with_retry("GET", "/push/v2/device/transactions", params=params)
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.warning("list_transactions: non-JSON response (status %d)", resp.status_code)
+            return []
         # Duo returns {"stat": "OK", "response": {"transactions": [...], "current_time": ...}}
         # or sometimes {"stat": "OK", "response": [...]}.
         # Unwrap the transactions list regardless of shape.
@@ -144,7 +148,11 @@ class DeviceClient:
             f"/push/v2/device/transactions/{safe}",
             params={"answer": "approve"},
         )
-        return ApproveResult(http_status=resp.status_code, body=resp.json())
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+        return ApproveResult(http_status=resp.status_code, body=body)
 
     # ------------------------------------------------------------------ signing
 
@@ -192,9 +200,6 @@ class DeviceClient:
         body = req.body
         if isinstance(body, str):
             body = body.encode("utf-8")
-        body = req.body
-        if isinstance(body, str):
-            body = body.encode("utf-8")
         record = {
             "event": "http_request",
             "method": method,
@@ -207,10 +212,17 @@ class DeviceClient:
         self._traffic_log.flush()
 
     def _log_traffic_response(self, method: str, req: requests.PreparedRequest, resp: requests.Response) -> None:
-        """Emit a response line to the traffic log (if enabled)."""
+        """Emit a response line to the traffic log (if enabled).
+
+        Redacts akey/pkey from the URL (the request logger creates its own
+        redacted URL but does NOT mutate req.url).
+        """
         if self._traffic_log is None:
             return
         from autoduo import redact
+        url_parts = urllib.parse.urlparse(req.url)
+        safe_query = redact.redact_query(url_parts.query or "")
+        safe_url = urllib.parse.urlunparse(url_parts._replace(query=safe_query))
         try:
             body_bytes = resp.content or b""
         except Exception:
@@ -218,7 +230,7 @@ class DeviceClient:
         record = {
             "event": "http_response",
             "method": method,
-            "url": req.url,  # already redacted at request time
+            "url": safe_url,
             "status": resp.status_code,
             "headers": redact.redact_headers(dict(resp.headers)),
             "body_sha256": _sha256(body_bytes),

@@ -37,7 +37,7 @@ import time
 from typing import Any, Callable, TextIO
 
 from autoduo import vault
-from autoduo.client import AuthError, DeviceClient, NetworkError
+from autoduo.client import AuthError, DeviceClient, NetworkError, RateLimitedError
 
 logger = logging.getLogger("autoduo.daemon")
 
@@ -235,6 +235,11 @@ class DuoBotDaemon:
         # Poll.
         try:
             txs = self._client.list_transactions()
+        except RateLimitedError as e:
+            self._record_auth_failure()
+            self._emit("rate_limited", error=str(e))
+            self._sleep(self._poll_interval)
+            return
         except NetworkError as e:
             self._consecutive_network_errors += 1
             self._backoff_seconds = min(

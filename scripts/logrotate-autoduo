@@ -7,10 +7,8 @@
     missingok
     notifempty
     create 0640 root root
-    sharedscripts
-    postrotate
-        systemctl reload-or-restart autoduo > /dev/null 2>&1 || true
-    endscript
+    # copytruncate is used, so no restart needed — daemon writes to the
+    # new file descriptor after copytruncate copies the old file.
 }
 
 /var/log/autoduo/audit.log {
