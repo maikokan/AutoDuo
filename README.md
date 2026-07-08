@@ -72,22 +72,16 @@ All commands require root (`sudo`).
 
 ## How It Works
 
-Duo has three HTTP APIs:
+When you try to log in to something protected by Duo, Duo sends a
+push notification to your phone asking "Approve?". AutoDuo replaces
+that phone — it sees the push and approves it for you automatically.
 
-| API | What it does | Can approve push? |
-|---|---|---|
-| `/auth/v2/` | User auth (send + poll) | **No** |
-| `/admin/v1/` | User management | **No** |
-| `/push/v2/...` | Mobile device protocol | **Yes** |
+On first run, AutoDuo enrolls itself as a "Duo Mobile device" using
+the same protocol the real Duo Mobile Android app uses. After that, it
+polls for pending push requests every 5 seconds and approves them.
 
-AutoDuo uses the third API — the same protocol as the real Duo Mobile
-Android app. On enrollment it generates an RSA-2048 keypair, registers
-it with Duo, and stores everything in an encrypted vault
-(AES-GCM, PBKDF2 600k rounds). The daemon then polls for pending
-pushes every 5 seconds and approves them automatically.
-
-No browser automation. No screen scraping. Just the same API calls
-the real app makes.
+No browser automation. No screen scraping. No cookies. Just the same
+API calls the real app makes.
 
 ---
 
