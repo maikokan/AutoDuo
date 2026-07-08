@@ -1,0 +1,39 @@
+/var/log/autoduo/daemon.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        systemctl reload-or-restart autoduo > /dev/null 2>&1 || true
+    endscript
+}
+
+/var/log/autoduo/audit.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    create 0640 root root
+    # PII WARNING: this log contains user/IP/location. Do not copy
+    # off-host without scrubbing. Permissions are 0640 root:root.
+}
+
+/var/log/autoduo/traffic.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    create 0640 root root
+    # Verbose HTTP traffic log (URLs, headers redacted). Off by default.
+}

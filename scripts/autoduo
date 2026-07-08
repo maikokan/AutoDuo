@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# autoduo — top-level entry point.
+# Usage: autoduo setup | install | uninstall | enroll | start | stop | restart | status | logs
+set -euo pipefail
+# Prefer venv python if it exists; fall back to system python.
+if [[ -x "/opt/autoduo/.venv/bin/python" ]]; then
+    exec /opt/autoduo/.venv/bin/python -m autoduo.cli "$@"
+else
+    exec python3 -m autoduo.cli "$@"
+fi
