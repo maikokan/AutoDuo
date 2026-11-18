@@ -2,6 +2,19 @@
 
 *2026-11-18 · baseline: `main` @ ff477bf · 114 tests passing · revised after review*
 
+> **Status.** Wave A is implemented on top of this baseline: 1.1, 1.2, 2.1,
+> 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 3.1, 3.3 and 4.1 are done, 161 tests pass, and
+> `bandit -r autoduo/ -ll` reports no issues. Still open: 1.3 (needs the
+> live-tenant measurement), 3.2, 3.4, 3.5, 4.2–4.6. Two things this audit
+> predicted were confirmed on the live host: `audit.log` did not exist, and
+> `/var/lib/autoduo` was 0755.
+>
+> The audit's 1.3 risk is **latent, not active**: of 215 approvals logged on
+> the production tenant, every urgid appears exactly twice — one `tx_seen`,
+> one `approve_ok` — so the minimal `answer=approve` payload with no `txId`
+> header was accepted every time. The divergence is still worth closing, but
+> it is not the cause of a broken deployment.
+
 This is an audit of how AutoDuo fails, not a feature wishlist. Every item was
 verified by reading the code, and the load-bearing ones were reproduced with
 a probe whose output is quoted below. Where a claim depends on Duo's server
@@ -15,6 +28,49 @@ speaks the same device protocol against a live tenant.
 failure (it cannot trip the circuit breaker — see 3.1), claimed no test
 exercises `main()` (one does — see 4.1), and under-ranked the poll path.
 Those are corrected here.
+
+## Status after Wave A
+
+Everything in this table is verified against the code, not intended. The rest
+of the document is left as written — it is the record of why each change was
+made, and the reasoning is still the reasoning.
+
+| Item | State |
+|---|---|
+| 1.1 poll `stat` / malformed body | **shipped** — raises `ProtocolError`, three doors closed |
+| 1.2 approval `stat` | **shipped** — `ApprovalRejected`, never logged `approve_ok`, never audited |
+| 1.3 approval payload | **open** — see the live evidence below; latent, not active |
+| 2.1 audit stream | **shipped** — `audit_log_stream` wired, `--audit-log` in both units |
+| 2.2 vault mode window + fsync | **shipped** — `mkstemp` 0600, fsync file + dir, parent tightened only if created |
+| 2.3 `/tmp` activation file | **shipped** — `mkstemp`, deleted in `finally` |
+| 2.4 passphrase file mode | **shipped** — `mode & 0o077` checked at startup |
+| 2.5 single instance | **shipped** — bounded `flock` beside the vault, exit **5**, never unlinked |
+| 2.6 signal handlers | **shipped** — plain bool flags, logging on the loop; reopen deliberately cut |
+| 2.7 expired transactions | **shipped** — skipped and parked |
+| 3.1 circuit breaker | **shipped** — auth-class allowlist, per-urgid cap, 429 no longer counts |
+| 3.2 watchdog | open |
+| 3.3 CI parity | **shipped** — `bandit -r autoduo/ -ll` exits 0 with no `--exclude`; nested venv deleted |
+| 3.4 double sleep on error paths | open |
+| 3.5 `seen.json` order / bound | open |
+| 4.1 `main()` assertions | **shipped** — `--audit-log` and `--state-file` asserted non-empty |
+| 4.2 installer unification | partial — `cli.py:319` fixed, `install.sh` vault dir now 0700; three installers still exist |
+| 4.3 dead code | partial |
+| 4.4 dependency pins | open |
+| 4.5 dry-run | open |
+| 4.6 clock skew | open |
+
+**Evidence that 1.3 is latent.** The live deployment on this host has made 215
+approvals since 2026-07-10. Each ursid appears exactly twice in `daemon.log` —
+one `tx_seen`, one `approve_ok` — and **never more**. A rejected approval stays
+in Duo's transaction list and would be re-approved after `push_ttl`, showing up
+four, six, eight times. The minimal `answer=approve` body is therefore accepted
+by this tenant today. That does not make it safe: it is an undocumented
+dependency on server-side leniency, and it can only be measured on a live
+tenant with 1.2's logging in place.
+
+**One correction found in production.** `audit.log` did not exist on the host —
+exactly as 2.1 predicted — which is the cheapest possible confirmation that the
+Tier-2 items were real and not theoretical.
 
 ## How to read this
 

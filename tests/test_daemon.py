@@ -13,6 +13,7 @@ Asserts:
 - Exit codes: 4 for VaultError on startup, 0 for clean shutdown.
 """
 import datetime
+import functools
 import io
 import json
 import pathlib
@@ -55,7 +56,7 @@ class FakeDeviceClient:
         if self._approve_raises:
             raise self._approve_raises
         from autoduo.client import ApproveResult
-        return ApproveResult(http_status=200, body={"response": "OK"})
+        return ApproveResult(http_status=200, body={"stat": "OK", "response": "OK"})
 
 
 @pytest.fixture
@@ -396,7 +397,7 @@ def test_heartbeat_emitted_when_no_transactions(fake_clock, fake_sleep, log_capt
 
 # --- Signals ---------------------------------------------------------------
 
-def test_signal_handler_sets_stop_event(fake_clock, fake_sleep, log_capture):
+def test_signal_handler_sets_stop_flag_without_logging(fake_clock, fake_sleep, log_capture):
     clock, _ = fake_clock
     sleep_fn, _ = fake_sleep
     client = FakeDeviceClient()
@@ -413,7 +414,9 @@ def test_signal_handler_sets_stop_event(fake_clock, fake_sleep, log_capture):
     # Synthesize a signal handler call.
     handler = d._install_signal_handlers()
     handler(signal.SIGTERM, None)
-    assert d._stop_event.is_set()
+    assert d._stop_requested is True
+    # Handlers must not do I/O (no logging mid-write / no locks).
+    assert log_capture.getvalue() == ""
 
 
 # --- Main entry ------------------------------------------------------------
@@ -421,8 +424,7 @@ def test_signal_handler_sets_stop_event(fake_clock, fake_sleep, log_capture):
 def test_main_with_vault(tmp_path, monkeypatch, fake_clock, fake_sleep, log_capture):
     """Smoke test: build a vault, then construct daemon from it.
 
-    Uses an unconnected client and exercises the run loop with the stop
-    event pre-set so main() returns immediately.
+    Exercises one real cycle so each opened stream is actually written.
     """
     from autoduo import vault
     from cryptography.hazmat.primitives import serialization
@@ -445,16 +447,295 @@ def test_main_with_vault(tmp_path, monkeypatch, fake_clock, fake_sleep, log_capt
         "activation": {},
     })
 
-    # Patch DeviceClient so we don't hit the network, and patch
-    # DuoBotDaemon.run() to return immediately.
-    monkeypatch.setattr("autoduo.daemon.DeviceClient", FakeDeviceClient)
+    audit_path = tmp_path / "audit.log"
+    state_path = tmp_path / "seen.json"
+
+    # Patch DeviceClient so we don't hit the network. The partial gives the
+    # constructed client one transaction to approve.
     monkeypatch.setattr(
-        "autoduo.daemon.DuoBotDaemon.run",
-        lambda self: 0,
+        "autoduo.daemon.DeviceClient",
+        functools.partial(
+            FakeDeviceClient, transactions_per_poll=[{"urgid": "u1"}]
+        ),
     )
+
+    def one_cycle(self):
+        self._run_once()
+        return 0
+
+    monkeypatch.setattr("autoduo.daemon.DuoBotDaemon.run", one_cycle)
 
     rc = daemon.main(argv=[
         "--vault", str(vpath),
         "--no-passphrase",
+        "--audit-log", str(audit_path),
+        "--state-file", str(state_path),
     ])
     assert rc == 0
+    # The audit stream is opened *and used* (2.1 regression).
+    audit_text = audit_path.read_text()
+    assert audit_text.strip()
+    assert "approved" in audit_text
+    # The state stream is opened *and used* (4.1 regression).
+    state_text = state_path.read_text()
+    assert state_text.strip()
+    assert "u1" in json.loads(state_text)
+
+
+def test_second_instance_exits_5(tmp_path, monkeypatch):
+    """A second daemon must refuse to start while the lock is held."""
+    from autoduo import vault
+
+    vpath = tmp_path / "vault.enc"
+    vault.seal(vpath, None, {"v": 1, "akey": "A", "pkey": "P", "host": "h"})
+
+    fd = daemon._acquire_instance_lock(vpath)
+    try:
+        monkeypatch.setattr(
+            "autoduo.daemon.DuoBotDaemon.run", lambda self: 0
+        )
+        rc = daemon.main(argv=["--vault", str(vpath), "--no-passphrase"])
+    finally:
+        import os
+        os.close(fd)
+    assert rc == daemon.EXIT_ALREADY_RUNNING == 5
+
+
+def test_world_readable_passphrase_file_rejected(tmp_path, monkeypatch):
+    from autoduo import vault
+
+    vpath = tmp_path / "vault.enc"
+    vault.seal(vpath, None, {"v": 1, "akey": "A", "pkey": "P", "host": "h"})
+    pass_file = tmp_path / "passphrase.txt"
+    pass_file.write_text("secret")
+    pass_file.chmod(0o644)
+
+    monkeypatch.setattr("autoduo.daemon.DuoBotDaemon.run", lambda self: 0)
+    rc = daemon.main(argv=[
+        "--vault", str(vpath),
+        "--passphrase-file", str(pass_file),
+    ])
+    assert rc == 4
+
+
+# --- Wave A regressions: visibility & classification -----------------------
+
+def _events(log_capture):
+    return [
+        json.loads(line)["event"]
+        for line in log_capture.getvalue().splitlines()
+        if line.strip()
+    ]
+
+
+def _make_daemon(client, clock, sleep_fn, log_capture, audit=None, **kw):
+    return daemon.DuoBotDaemon(
+        client=client,
+        poll_interval=5,
+        push_ttl=kw.pop("push_ttl", 60),
+        log_stream=log_capture,
+        clock=clock,
+        sleep=sleep_fn,
+        audit_log_stream=audit,
+        max_auth_failures=kw.pop("max_auth_failures", 5),
+        auth_failure_window=300,
+        **kw,
+    )
+
+
+def test_protocol_error_on_poll_is_emitted_and_backs_off(
+    fake_clock, fake_sleep, log_capture
+):
+    from autoduo.client import ProtocolError
+    clock, _ = fake_clock
+    sleep_fn, sleeps = fake_sleep
+
+    class FailPoll(FakeDeviceClient):
+        def list_transactions(self):
+            raise ProtocolError("stat FAIL", code=40301)
+
+    d = _make_daemon(FailPoll(), clock, sleep_fn, log_capture)
+    d._run_once()
+    lines = [
+        json.loads(line)
+        for line in log_capture.getvalue().splitlines()
+        if line.strip()
+    ]
+    assert "protocol_error" in [line["event"] for line in lines]
+    err = [line for line in lines if line["event"] == "protocol_error"][0]
+    assert err["code"] == 40301
+    assert err["error"] == "stat FAIL"
+    assert sleeps  # backed off rather than falling through to an empty poll
+
+
+def test_unexpected_poll_error_is_caught_and_backs_off(
+    fake_clock, fake_sleep, log_capture
+):
+    clock, _ = fake_clock
+    sleep_fn, sleeps = fake_sleep
+
+    class BoomPoll(FakeDeviceClient):
+        def list_transactions(self):
+            raise RuntimeError("boom")
+
+    d = _make_daemon(BoomPoll(), clock, sleep_fn, log_capture)
+    d._run_once()  # must not raise
+    assert "poll_unexpected_error" in _events(log_capture)
+    assert sleeps
+
+
+def test_rejected_approval_is_not_ok_and_not_audited(
+    fake_clock, fake_sleep, log_capture
+):
+    from autoduo.client import ApprovalRejected
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    audit = io.StringIO()
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+        approve_raises=ApprovalRejected("wrong step-up code", code="40032"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture, audit=audit)
+    d._run_once()
+    events = _events(log_capture)
+    assert "approve_rejected" in events
+    assert "approve_ok" not in events
+    assert audit.getvalue() == ""
+
+
+def test_terminal_rejection_not_retried_after_push_ttl(
+    fake_clock, fake_sleep, log_capture
+):
+    from autoduo.client import ApprovalRejected
+    clock, advance = fake_clock
+    sleep_fn, _ = fake_sleep
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+        approve_raises=ApprovalRejected("step-up", code="40032"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture, push_ttl=60)
+    d._run_once()
+    assert client.approved == ["u1"]
+    advance(120)  # well past push_ttl
+    d._run_once()
+    # Terminal set is not evicted by _evict_expired: no second POST.
+    assert client.approved == ["u1"]
+
+
+def test_transient_rejection_retried_up_to_attempt_cap(
+    fake_clock, fake_sleep, log_capture
+):
+    from autoduo.client import ApprovalRejected
+    clock, advance = fake_clock
+    sleep_fn, _ = fake_sleep
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+        approve_raises=ApprovalRejected("unknown", code="99999"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture)
+    for _ in range(6):
+        d._run_once()
+        advance(5)
+    assert client.approved == ["u1", "u1", "u1"]  # 3 attempts, then parked
+    assert "u1" in d._terminal
+
+
+def test_five_unrelated_rejections_do_not_open_circuit(
+    fake_clock, fake_sleep, log_capture
+):
+    from autoduo.client import ApprovalRejected
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": f"u{i}"} for i in range(5)],
+        approve_raises=ApprovalRejected("unknown", code="99999"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture, max_auth_failures=5)
+    d._run_once()
+    assert len(client.approved) == 5
+    assert d._circuit_open_until is None
+
+
+def test_approval_auth_errors_feed_circuit_across_cycles(
+    fake_clock, fake_sleep, log_capture
+):
+    """A successful poll must not erase an approval's AuthError (3.1)."""
+    from autoduo.client import AuthError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+        approve_raises=AuthError("401"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture, max_auth_failures=3)
+    for _ in range(3):
+        d._run_once()
+    assert d._circuit_open_until is not None
+    # Circuit is credential-scoped; it opened from the approvals.
+    assert len(client.approved) == 3
+
+
+def test_expired_transaction_is_skipped_and_parked(
+    fake_clock, fake_sleep, log_capture
+):
+    clock, advance = fake_clock
+    sleep_fn, _ = fake_sleep
+    expired_at = clock().timestamp() - 1
+    client = FakeDeviceClient(
+        transactions_per_poll=[
+            {"urgid": "u1", "expiration": expired_at}
+        ]
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture)
+    d._run_once()
+    assert client.approved == []
+    assert "tx_expired" in _events(log_capture)
+    advance(120)
+    d._run_once()
+    assert client.approved == []
+
+
+def test_rate_limited_poll_does_not_feed_auth_circuit(
+    fake_clock, fake_sleep, log_capture
+):
+    """429 is backpressure, not auth: 10 bursts must not open the circuit."""
+    from autoduo.client import RateLimitedError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+
+    class AlwaysLimited(FakeDeviceClient):
+        def list_transactions(self):
+            raise RateLimitedError("429")
+
+    d = _make_daemon(
+        AlwaysLimited(), clock, sleep_fn, log_capture, max_auth_failures=1
+    )
+    for _ in range(10):
+        d._run_once()
+    assert d._circuit_open_until is None
+    assert len(d._auth_failures) == 0
+
+
+def test_state_save_preserves_shared_dir_mode(
+    tmp_path, fake_clock, fake_sleep, log_capture
+):
+    """seen.json goes into an existing (possibly shared) directory: the
+    daemon must not chmod that directory, only create a 0600 file."""
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    state_path = shared / "seen.json"
+
+    d = _make_daemon(
+        FakeDeviceClient(transactions_per_poll=[{"urgid": "u1"}]),
+        clock, sleep_fn, log_capture, state_path=state_path,
+    )
+    d._run_once()
+    d._save_seen_state()
+
+    import stat as stat_mod
+    assert stat_mod.S_IMODE(shared.stat().st_mode) == 0o755
+    assert stat_mod.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert json.loads(state_path.read_text())["u1"]

@@ -3,15 +3,20 @@ Description=autoduo: headless Duo auto-accept daemon
 Documentation=file:///opt/autoduo/README.md
 After=network-online.target time-sync.target
 Wants=network-online.target time-sync.target
+# A second instance exits 5 (single-instance lock held) and must not be
+# able to exhaust the start limit of the instance that is actually running.
 StartLimitIntervalSec=300
-StartLimitBurst=10
+StartLimitBurst=30
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/autoduo
-ExecStart=/opt/autoduo/.venv/bin/python -m autoduo.daemon --vault /var/lib/autoduo/vault.enc --no-passphrase --state-file /var/lib/autoduo/seen.json --log-file /var/log/autoduo/daemon.log --poll-interval 5 --push-ttl 60
+ExecStart=/opt/autoduo/.venv/bin/python -m autoduo.daemon --vault /var/lib/autoduo/vault.enc --no-passphrase --state-file /var/lib/autoduo/seen.json --audit-log /var/log/autoduo/audit.log --log-file /var/log/autoduo/daemon.log --poll-interval 5 --push-ttl 60
 Restart=always
 RestartSec=5
+# 5 = another instance holds the single-instance lock. Restarting cannot
+# help, and a restart storm would mask the real one.
+RestartPreventExitStatus=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=autoduo

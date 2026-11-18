@@ -22,7 +22,11 @@ echo "==> enabling time-sync (signature timestamps must be accurate)"
 systemctl enable --now systemd-timesyncd
 
 echo "==> creating runtime directories"
-install -d -m 0755 "$VAULT_DIR" "$LOG_DIR"
+# The vault directory holds the only copy of the device's private key and
+# must not be traversable by other users. Logs stay 0755; the files inside
+# are 0640.
+install -d -m 0700 "$VAULT_DIR"
+install -d -m 0755 "$LOG_DIR"
 
 echo "==> creating venv"
 if [[ ! -d "$REPO_DIR/.venv" ]]; then

@@ -58,6 +58,35 @@ class NetworkError(Exception):
     """5xx or transport failure after exhausting retries."""
 
 
+class ProtocolError(Exception):
+    """Duo answered HTTP 2xx but the body is not a usable protocol reply.
+
+    Duo reports logical failures as HTTP 200 with
+    ``{"stat": "FAIL", "code": ..., "message": ...}``.  Returning an empty
+    transaction list for one of those makes a broken poll indistinguishable
+    from "no pushes", so every unusable poll body raises this instead.
+    """
+
+    def __init__(self, message: str = "", code: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class ApprovalRejected(Exception):
+    """Duo rejected an approval at the protocol level (``stat != "OK"``).
+
+    HTTP 200 with a logical failure is not success.  ``code`` carries the
+    Duo error code (for retry classification) and ``message`` the server's
+    explanation.
+    """
+
+    def __init__(self, message: str = "", code: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass
 class ApproveResult:
     http_status: int
@@ -119,22 +148,50 @@ class DeviceClient:
         resp = self._request_with_retry("GET", "/push/v2/device/transactions", params=params)
         try:
             body = resp.json()
-        except ValueError:
-            logger.warning("list_transactions: non-JSON response (status %d)", resp.status_code)
-            return []
+        except ValueError as e:
+            raise ProtocolError(
+                f"list_transactions: non-JSON response (status {resp.status_code})"
+            ) from e
+
+        # A bare list cannot express a logical failure; accept it as the
+        # transaction list (legacy / odd-but-harmless shape).
+        if isinstance(body, list):
+            return list(body)
+
+        if not isinstance(body, dict):
+            raise ProtocolError(
+                "list_transactions: unrecognised response body "
+                f"({type(body).__name__})",
+                code="malformed",
+            )
+
+        # Duo reports logical errors as HTTP 200 {"stat": "FAIL", ...}.
+        # Only a *present* non-OK stat is fatal: legacy bodies and old
+        # fakes omit stat entirely, so absence must keep polling.
+        stat = body.get("stat")
+        if "stat" in body and stat != "OK":
+            raise ProtocolError(
+                str(body.get("message") or "list_transactions rejected"),
+                code=body.get("code"),
+            )
+
         # Duo returns {"stat": "OK", "response": {"transactions": [...], "current_time": ...}}
         # or sometimes {"stat": "OK", "response": [...]}.
-        # Unwrap the transactions list regardless of shape.
-        if isinstance(body, dict):
-            response = body.get("response")
-            if isinstance(response, dict):
-                txs = response.get("transactions")
-                if isinstance(txs, list):
-                    return list(txs)
-            if isinstance(response, list):
-                return list(response)
-        if isinstance(body, list):
-            return body
+        response = body.get("response")
+        if isinstance(response, dict):
+            txs = response.get("transactions")
+            if isinstance(txs, list):
+                return list(txs)
+        if isinstance(response, list):
+            return list(response)
+
+        # stat == "OK" but no recognisable transaction list is malformed.
+        # (stat absent keeps the historical unwrap-or-empty behaviour.)
+        if "stat" in body:
+            raise ProtocolError(
+                "list_transactions: stat=OK but response is malformed",
+                code="malformed",
+            )
         return []
 
     def approve(self, urgid: str) -> ApproveResult:
@@ -152,6 +209,11 @@ class DeviceClient:
             body = resp.json()
         except ValueError:
             body = {}
+        if isinstance(body, dict) and "stat" in body and body["stat"] != "OK":
+            raise ApprovalRejected(
+                str(body.get("message") or "approval rejected"),
+                code=body.get("code"),
+            )
         return ApproveResult(http_status=resp.status_code, body=body)
 
     # ------------------------------------------------------------------ signing
@@ -162,7 +224,6 @@ class DeviceClient:
         path: str,
         params: dict[str, Any],
     ) -> requests.Response:
-        from autoduo import redact
         date = protocol.now_rfc1123(clock=self._clock)
         canonical = protocol.canonical_request(date, method, self.host, path, params)
         sig = protocol.sign(self._private_key, canonical)
@@ -172,12 +233,15 @@ class DeviceClient:
             date_rfc1123=date,
         )
         url = f"https://{self.host}{path}"
-        # For GET, params go in the query string; for POST they go in body.
-        # requests handles this via `params=` for GET and `data=` for POST.
+        # Signed order == transmitted order.  protocol.canonical_request()
+        # signs urlencode(sorted(params.items())); transmit the same sorted
+        # sequence.  Pass a LIST OF TUPLES (not a pre-encoded string): a
+        # string body makes requests set no Content-Type at all.
+        ordered = sorted(params.items())
         if method.upper() == "GET":
-            req = requests.Request(method, url, params=params, headers=headers).prepare()
+            req = requests.Request(method, url, params=ordered, headers=headers).prepare()
         else:
-            req = requests.Request(method, url, data=params, headers=headers).prepare()
+            req = requests.Request(method, url, data=ordered, headers=headers).prepare()
 
         self._log_traffic_request(method, req)
 

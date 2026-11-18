@@ -14,6 +14,7 @@ hit the network. Asserts:
 """
 import base64
 import json
+import pathlib
 import time
 import urllib.parse
 from unittest.mock import MagicMock
@@ -21,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from autoduo import client
+from autoduo import client, protocol
 
 
 # --- Mock transport --------------------------------------------------------
@@ -135,7 +136,7 @@ def test_urgid_url_quoted(golden_key_pem, monkeypatch):
             self.calls.append(request)
             resp = requests.Response()
             resp.status_code = 200
-            resp._content = b'{"response": "OK"}'
+            resp._content = b'{"stat": "OK", "response": "OK"}'
             return resp
 
     cap = Capture()
@@ -148,7 +149,7 @@ def test_urgid_url_quoted(golden_key_pem, monkeypatch):
 # --- list_transactions -----------------------------------------------------
 
 def test_list_transactions_returns_parsed_json(device_client, monkeypatch):
-    transport = MockTransport([(200, {}, {"response": [{"urgid": "u1"}, {"urgid": "u2"}]})])
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": [{"urgid": "u1"}, {"urgid": "u2"}]})])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     txs = device_client.list_transactions()
     assert len(txs) == 2
@@ -236,7 +237,7 @@ def test_list_transactions_signs_with_canonical_string(golden_key_pem, monkeypat
 # --- approve ---------------------------------------------------------------
 
 def test_approve_posts_answer_approve_to_urgid_url(device_client, monkeypatch):
-    transport = MockTransport([(200, {}, {"response": "OK"})])
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": "OK"})])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     result = device_client.approve("abc123")
     req = transport.calls[0]
@@ -250,11 +251,11 @@ def test_approve_posts_answer_approve_to_urgid_url(device_client, monkeypatch):
 
 
 def test_approve_returns_approve_result(device_client, monkeypatch):
-    transport = MockTransport([(200, {}, {"response": "OK"})])
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": "OK"})])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     result = device_client.approve("abc123")
     assert result.http_status == 200
-    assert result.body == {"response": "OK"}
+    assert result.body == {"stat": "OK", "response": "OK"}
 
 
 # --- Retry / backoff branches ---------------------------------------------
@@ -265,7 +266,7 @@ def test_429_uses_retry_after(device_client, monkeypatch):
     # 429 with Retry-After, then 200.
     transport = MockTransport([
         (429, {"Retry-After": "7"}, None),
-        (200, {}, {"response": []}),
+        (200, {}, {"stat": "OK", "response": []}),
     ])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     device_client.list_transactions()
@@ -291,7 +292,7 @@ def test_5xx_triggers_exponential_backoff(device_client, monkeypatch):
     transport = MockTransport([
         (503, {}, None),
         (503, {}, None),
-        (200, {}, {"response": []}),
+        (200, {}, {"stat": "OK", "response": []}),
     ])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     device_client.list_transactions()
@@ -344,6 +345,130 @@ def test_network_error_triggers_retry(device_client, monkeypatch):
     device_client.list_transactions()
     # One retry sleep then success.
     assert len(sleeps) >= 1
+
+
+# --- Protocol validation (ROBUSTNESS 1.1 / 1.2) ----------------------------
+
+def test_list_transactions_raises_on_stat_fail(device_client, monkeypatch):
+    transport = MockTransport([
+        (200, {}, {"stat": "FAIL", "code": 40301, "message": "no akey"})
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.list_transactions()
+    assert ei.value.code == 40301
+    assert ei.value.message == "no akey"
+
+
+def test_list_transactions_stat_fail_beats_usable_response(device_client, monkeypatch):
+    """A FAIL body with something that looks like a transaction list is
+    still a failure — checking shape first would swallow it."""
+    transport = MockTransport([
+        (200, {}, {"stat": "FAIL", "code": 1, "response": [{"urgid": "u1"}]})
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError):
+        device_client.list_transactions()
+
+
+def test_list_transactions_raises_on_ok_without_transactions(device_client, monkeypatch):
+    transport = MockTransport([(200, {}, {"stat": "OK"})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.list_transactions()
+    assert ei.value.code == "malformed"
+
+
+def test_list_transactions_accepts_missing_stat_legacy_shape(
+    device_client, monkeypatch
+):
+    """stat absent must keep polling: old bodies/fakes omit it."""
+    transport = MockTransport([(200, {}, {"response": [{"urgid": "u1"}]})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    assert device_client.list_transactions() == [{"urgid": "u1"}]
+
+
+def test_list_transactions_raises_on_non_json_body(device_client, monkeypatch):
+    transport = MockTransport([(200, {}, None)])  # empty body -> ValueError
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError):
+        device_client.list_transactions()
+
+
+def test_list_transactions_accepts_bare_list(device_client, monkeypatch):
+    """A bare list cannot carry stat=FAIL; accept it as the tx list."""
+    transport = MockTransport([(200, {}, [{"urgid": "u1"}])])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    assert device_client.list_transactions() == [{"urgid": "u1"}]
+
+
+def test_approve_raises_on_stat_fail(device_client, monkeypatch):
+    transport = MockTransport([
+        (200, {}, {"stat": "FAIL", "code": "40032", "message": "step-up"})
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ApprovalRejected) as ei:
+        device_client.approve("abc123")
+    assert ei.value.code == "40032"
+    assert ei.value.message == "step-up"
+
+
+def test_approve_accepts_body_without_stat(device_client, monkeypatch):
+    """Legacy/partial bodies omit stat; only a present non-OK stat fails."""
+    transport = MockTransport([(200, {}, {"response": "OK"})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    result = device_client.approve("abc123")
+    assert result.http_status == 200
+
+
+def test_signed_bytes_equal_transmitted_bytes_for_out_of_order_params(
+    device_client, monkeypatch
+):
+    """canonical_request signs sorted(params); the wire must carry the same
+    order and encoding (ROBUSTNESS 1.3 coupling)."""
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": []})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+
+    device_client._signed_request(
+        "POST",
+        "/push/v2/device/transactions/abc123",
+        {"zeta": "1", "alpha": "2"},  # deliberately not sorted
+    )
+
+    req = transport.calls[0]
+    body = req.body
+    if isinstance(body, bytes):
+        body = body.decode()
+    # Transmitted as sorted key/value pairs, form-encoded (Content-Type set).
+    assert body == "alpha=2&zeta=1"
+    assert req.headers["Content-Type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+
+    pairs = urllib.parse.parse_qsl(body)
+    assert pairs == [("alpha", "2"), ("zeta", "1")]
+    canon = protocol.canonical_request(
+        req.headers["x-duo-date"], req.method, device_client.host,
+        "/push/v2/device/transactions/abc123", dict(pairs),
+    )
+    # The final canonical line is exactly the bytes on the wire.
+    assert canon.rsplit("\n", 1)[1] == body
+
+    # And the signature verifies over that canonical string.
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    key = serialization.load_pem_private_key(
+        (pathlib.Path(__file__).parent / "_golden_key.pem").read_bytes(),
+        password=None,
+    )
+    auth = req.headers["Authorization"]
+    sig_b64 = base64.b64decode(auth.split(" ", 1)[1]).decode().split(":", 1)[1]
+    key.public_key().verify(
+        base64.b64decode(sig_b64),
+        canon.encode("ascii"),
+        padding.PKCS1v15(),
+        hashes.SHA512(),
+    )
 
 
 # --- helpers ---------------------------------------------------------------
