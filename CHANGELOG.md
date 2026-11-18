@@ -5,6 +5,47 @@ All notable changes to autoduo are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Per-account instances.** Each Duo account is an independent process with
+  its own vault, state file, log directory, lock and `autoduo@<name>.service`
+  unit, so two accounts cannot affect each other. The instance named
+  `default` keeps the original paths, so existing installs need no migration.
+- `autoduo instances` lists every configured account with its state.
+- `autoduo watch`: a live terminal dashboard — per-account state, approvals in
+  the last 24 h, pending pushes, and the age of the last approval. Plain
+  single-frame output when piped.
+- Per-instance `--instance NAME` on every command, accepted before or after
+  the verb.
+
+### Fixed
+- A poll answering HTTP 200 with `stat: FAIL` returned an empty list and
+  emitted nothing, so a failed poll looked exactly like "no pushes". It now
+  raises and is reported.
+- An approval Duo rejected was logged as `approve_ok`, written to the audit
+  log, and marked seen, so it was never retried. It is now reported as
+  rejected, is not audited, and is retried or parked deliberately.
+- The audit log was opened and never used, so `audit.log` never existed.
+- The vault was world-readable between `rename` and `chmod`, and was not
+  fsynced; both fixed, and the parent directory is only tightened when this
+  program created it.
+- The activation URL was written to a predictable `/tmp` path before being
+  chmodded; it now uses `mkstemp` and is removed in a `finally`.
+- `autoduo install` copied the package directory to `/usr/local/bin/autoduo`
+  and raised `IsADirectoryError`; it now installs the wrapper script.
+- Two daemons could run for the same vault and approve each push twice. A
+  second copy now exits 5 and systemd does not restart it.
+- Signal handlers did file I/O and could re-enter the log stream.
+- Expired pushes were approved; they are now skipped.
+- The circuit breaker could never fire for approval errors, because a
+  successful poll cleared the failure count. Authentication failures and
+  rate limiting are now counted separately and correctly.
+
+### Changed
+- The terminal output was restyled: no box drawing, one accent, word labels,
+  plain-text fallback that stays under 80 columns.
+
 ## [0.1.0] - 2026-07-08
 
 ### Added

@@ -20,7 +20,7 @@ echo
 echo "WARNING: AutoDuo defeats Duo 2FA by design."
 echo "See https://github.com/maikokan/AutoDuo#threat-model for details."
 echo
-read -p "Type 'I ACCEPT' to continue: " CONFIRM
+read -r -p "Type 'I ACCEPT' to continue: " CONFIRM < /dev/tty
 if [[ "$CONFIRM" != "I ACCEPT" ]]; then
     echo "Aborted."
     exit 1

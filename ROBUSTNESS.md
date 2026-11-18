@@ -53,14 +53,14 @@ made, and the reasoning is still the reasoning.
 | 3.4 double sleep on error paths | open |
 | 3.5 `seen.json` order / bound | open |
 | 4.1 `main()` assertions | **shipped** — `--audit-log` and `--state-file` asserted non-empty |
-| 4.2 installer unification | partial — `cli.py:319` fixed, `install.sh` vault dir now 0700; three installers still exist |
-| 4.3 dead code | partial |
+| 4.2 installer unification | partial — `cli.py` copies `scripts/autoduo` (the `IsADirectoryError` is gone), `install.sh` uses `read -r`, vault dir 0700; three installers still exist |
+| 4.3 dead code | partial — `redact_transaction()` has tests but no caller; `migrate()` still uncalled; the superseded `ui.py` helpers were reconciled and are now used by `dashboard.py` |
 | 4.4 dependency pins | open |
 | 4.5 dry-run | open |
 | 4.6 clock skew | open |
 
 **Evidence that 1.3 is latent.** The live deployment on this host has made 215
-approvals since 2026-07-10. Each ursid appears exactly twice in `daemon.log` —
+approvals since 2026-07-10. Each urgid appears exactly twice in `daemon.log` —
 one `tx_seen`, one `approve_ok` — and **never more**. A rejected approval stays
 in Duo's transaction list and would be re-approved after `push_ttl`, showing up
 four, six, eight times. The minimal `answer=approve` body is therefore accepted
@@ -71,6 +71,20 @@ tenant with 1.2's logging in place.
 **One correction found in production.** `audit.log` did not exist on the host —
 exactly as 2.1 predicted — which is the cheapest possible confirmation that the
 Tier-2 items were real and not theoretical.
+
+**Wave B — one process per account.** The multi-account work was done under the
+same rule, because two accounts sharing a lock, a path or an uninstall is a
+robustness defect with a friendly name:
+
+- every instance has its own vault, state file, lock, log directory and unit, so
+  the single-instance guard of 2.5 now protects each account instead of one
+  global vault;
+- `instances.status()` never raises and never prints — a live dashboard cannot
+  crash the terminal it is drawn in;
+- `uninstall` is scoped to one instance; the old code `rmtree`'d all of
+  `/var/lib/autoduo`, which after this change would have deleted every account;
+- `status` on an instance that was never enrolled exits 1 instead of inheriting
+  `systemctl`'s silence — the same false-green as 1.1, one layer up.
 
 ## How to read this
 

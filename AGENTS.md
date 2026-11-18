@@ -27,6 +27,8 @@ Scale: ~2,100 lines of Python in 8 modules, 2 runtime deps (`requests`,
 
 # Run a CLI from the source tree (no install needed)
 .venv/bin/python -m autoduo.cli version
+.venv/bin/python -m autoduo.cli instances
+.venv/bin/python -m autoduo.cli watch          # one frame when piped
 .venv/bin/python -m autoduo.enroll --help
 .venv/bin/python -m autoduo.daemon --help
 
@@ -34,8 +36,8 @@ Scale: ~2,100 lines of Python in 8 modules, 2 runtime deps (`requests`,
 .venv/bin/python -m pytest tests/ -v
 .venv/bin/bandit -r autoduo/ -ll
 python3 -m compileall autoduo/
-shellcheck scripts/autoduo scripts/install.sh scripts/uninstall.sh
-systemd-analyze verify systemd/autoduo.service
+shellcheck scripts/autoduo scripts/install.sh scripts/uninstall.sh install.sh
+systemd-analyze verify systemd/autoduo.service systemd/autoduo@.service
 ```
 
 CI runs pytest + bandit on Python 3.10, 3.11, 3.12, plus a lint job for
@@ -47,26 +49,51 @@ shellcheck, compileall and `systemd-analyze verify`.
 |---|---|
 | `autoduo/__init__.py` | `__version__` only. |
 | `autoduo/__main__.py` | `python -m autoduo` → `cli.main()`. |
-| `autoduo/cli.py` | Operator CLI (`setup`/`install`/`enroll`/`start`/`status`/…). Mostly `subprocess` wrappers around `systemctl`/`apt-get` + interactive prompts. Does **not** talk to Duo directly — it shells out to `python -m autoduo.enroll`. |
+| `autoduo/cli.py` | Operator CLI (`setup`/`install`/`enroll`/`start`/`status`/`instances`/`watch`/…). Mostly `subprocess` wrappers around `systemctl`/`apt-get` + interactive prompts. Does **not** talk to Duo directly — it shells out to `python -m autoduo.enroll`. |
+| `autoduo/instances.py` | The single source of truth for where an instance lives: name validation, path resolution, legacy mapping, and `status()`/`status_all()`. Never prints, never exits, never raises — it runs inside the live dashboard. |
+| `autoduo/ui.py` | Presentation primitives (accent, headings, `kv`, `rule`, state words). Colour only on a TTY, never with `NO_COLOR`; every primitive has a plain fallback. |
+| `autoduo/dashboard.py` | `autoduo watch`: the live multi-instance view. Alternate screen on a TTY, one plain frame when piped. |
 | `autoduo/enroll.py` | One-shot enrollment CLI. URL → `(host, code)`, RSA-2048 keypair, POST `/push/v2/activation/<code>`, seal the vault. |
-| `autoduo/vault.py` | Encrypted container `DVB1`: magic(4)+schema(4)+salt(32)+nonce(12)+ciphertext. PBKDF2-HMAC-SHA256 ×600k → AES-256-GCM. AAD = magic+version+salt. |
+| `autoduo/vault.py` | Encrypted container `DVB1`: magic(4)+schema(4)+salt(32)+nonce(12)+ciphertext. PBKDF2-HMAC-SHA256 ×600k → AES-256-GCM. AAD = magic+version+salt. Also the instance lock (`acquire_instance_lock`). |
 | `autoduo/protocol.py` | Request signing: canonical string, PKCS#1 v1.5 / SHA-512, `Authorization: Basic base64(pkey:b64sig)` + `x-duo-date`. |
-| `autoduo/client.py` | `DeviceClient`: signed HTTP, retry taxonomy, `.duosecurity.com` allowlist, opt-in traffic log. |
+| `autoduo/client.py` | `DeviceClient`: signed HTTP, retry taxonomy, `.duosecurity.com` allowlist, opt-in traffic log, `ProtocolError`/`ApprovalRejected` for `stat != "OK"`. |
 | `autoduo/redact.py` | The log boundary. `akey`/`pkey` are length-only (`<28 chars:hidden>`); `Authorization`/`x-duo-date` replaced wholesale. |
-| `autoduo/daemon.py` | The poll→dedup→approve loop, circuit breaker, backoff, JSON event log, signals, `seen.json` persistence. |
+| `autoduo/daemon.py` | The poll→dedup→approve loop, circuit breaker, backoff, JSON event log, signals, `seen.json` persistence, single-instance lock. |
 
 ### Runtime flow
 
-1. systemd starts `python -m autoduo.daemon` (see `systemd/autoduo.service`).
-2. Daemon opens the vault → builds `DeviceClient(host, pkey, akey, private_key_pem)`.
-3. Loop: `GET /push/v2/device/transactions` (signed) → dedup by `urgid`
+1. systemd starts `python -m autoduo.daemon` — either `autoduo.service`
+   (instance `default`, legacy paths) or `autoduo@<name>.service`.
+2. Daemon takes a `flock` on `<vault>.lock` **before** opening the vault.
+   A second copy exits 5 and the unit's `RestartPreventExitStatus=5` stops
+   it from restart-looping the copy that is running.
+3. Daemon opens the vault → builds `DeviceClient(host, pkey, akey, private_key_pem)`.
+4. Loop: `GET /push/v2/device/transactions` (signed) → dedup by `urgid`
    (TTL 60 s, persisted to `seen.json` every 60 s) → for unseen urgids:
    mark seen **before** calling, then `POST /push/v2/device/transactions/<urgid>`
-   with `answer=approve`; un-mark on failure so the next poll retries.
-4. Errors branch on exception type: `AuthError` → circuit breaker
-   (≥5 in 300 s → 5 min cooldown, no work done), `NetworkError` →
-   daemon-side exponential backoff (base 1 s, cap 60 s), `RateLimitedError`
-   → log and continue.
+   with `answer=approve`.
+5. A response is only a success if `stat == "OK"`. A poll that answers
+   `stat != "OK"` raises `ProtocolError`; an approval that does raises
+   `ApprovalRejected`, which is classified as terminal (parked, never
+   retried), auth-class (allowlist, feeds the circuit), or transient
+   (retried up to `MAX_APPROVE_ATTEMPTS`, then parked).
+6. Errors branch on type: `AuthError` and auth-class rejections → circuit
+   breaker (≥5 in 300 s → 5 min cooldown), `NetworkError` → exponential
+   backoff (base 1 s, cap 60 s), `RateLimitedError` → its own backoff and
+   **not** the circuit.
+
+### Instance layout
+
+| | `default` (legacy) | `<name>` |
+|---|---|---|
+| vault | `/var/lib/autoduo/vault.enc` | `/var/lib/autoduo/instances/<name>/vault.enc` |
+| state | `/var/lib/autoduo/seen.json` | `/var/lib/autoduo/instances/<name>/seen.json` |
+| logs | `/var/log/autoduo/` | `/var/log/autoduo/<name>/` |
+| unit | `autoduo.service` | `autoduo@<name>.service` |
+
+Instance names are validated to `[a-z0-9][a-z0-9_-]{0,31}` before reaching a
+path or a unit name. Two accounts are two processes; there is deliberately no
+multi-account vault, because Duo enrolls one device per user.
 
 ### Enrollment flow (manual, once)
 
@@ -105,41 +132,40 @@ approved.
 ## Known gaps — verified, not speculation
 
 These are real mismatches between code and docs. Check whether a fix has
-landed before acting on them.
+landed before acting on them. Items 1 and 2 of the original audit
+(`autoduo install` copying a directory, and the audit stream being opened
+and discarded) are **fixed**; they are recorded in `ROBUSTNESS.md`.
 
-1. **`sudo autoduo install` raises `IsADirectoryError`.**
-   `cli.py:319` copies `REPO_DIR / "autoduo"` — the *package directory* —
-   instead of `REPO_DIR / "scripts" / "autoduo"`. The shell path
-   (`scripts/install.sh:38`) is correct. Use `bash scripts/install.sh`.
-   Also: README says `sudo ./autoduo setup`, but no `./autoduo` exists at
-   the repo root; the wrapper is `scripts/autoduo`.
-2. **The audit log is never written.** `daemon.main()` opens the
-   `--audit-log` stream (`daemon.py:433-441`) but never passes
-   `audit_log_stream=` to `DuoBotDaemon(...)` (`daemon.py:489-495`), so
-   `_emit_audit` no-ops. The systemd unit doesn't pass `--audit-log`
-   either. README/CHANGELOG/SECURITY.md all promise `audit.log`.
-3. **`redact.redact_transaction()` is dead code** — never called by the
+1. **`redact.redact_transaction()` is dead code** — never called by the
    daemon. SECURITY.md claims PII is stripped "via redact_transaction()
    before logging"; it isn't. The audit fields written today are safe by
    construction, so this is a doc bug unless the audit payload grows.
-4. **`vault.migrate()` has no caller.** `open_vault` hard-fails on a
-   version mismatch. The schema-migration hook is a placeholder.
-5. **Contradictory docstrings in `enroll.py`.** `_normalize_activation_url`
-   says the endpoint wants a composite `{SHORT_CODE}-{base64(API_HOST)}`
-   code; `_post_activation` posts the *short* code and says so itself.
-   The implemented path is `/activate/CODE` → short code → POST.
-6. **Error paths sleep twice** — `_run_once` sleeps on the error branch
-   and the outer `run()` loop sleeps again.
-7. **`.slim/deepwork/` is stale and gitignored.** It describes a `duo_bot/`
+2. **`vault.migrate()` has no caller.** `open_vault` hard-fails on a
+   schema version mismatch. The migration hook is a placeholder, so a
+   future `DVB1` → `DVB2` bump would strand every existing vault.
+3. **Contradictory docstrings in `enroll.py`.** `_normalize_activation_url`
+   claims the endpoint wants a composite `{SHORT_CODE}-{base64(API_HOST)}`
+   code; the code it actually returns, and `_post_activation` posts, is
+   the short code. The implemented path is `/activate/CODE` → short code.
+4. **Error paths sleep twice** — `_note_poll_error()` sleeps the backoff
+   and the outer `run()` loop then sleeps `poll_interval` on top, so a
+   network error waits backoff + 5 s rather than the backoff it logged.
+5. **`autoduo watch` exits 0 when it cannot read statuses.** Piped mode
+   prints the error line and returns 0, so a script cannot tell a broken
+   dashboard from a quiet one. The live loop returns 0 too.
+6. **`.slim/deepwork/` is stale and gitignored.** It describes a `duo_bot/`
    package and `/var/lib/duo-bot/` paths, both since renamed to
    `autoduo/` and `/var/lib/autoduo/`. Useful for intent; not current
    fact. Never publish it.
-8. **Clock accuracy is functional.** `x-duo-date` is inside the signed
+7. **Clock accuracy is functional.** `x-duo-date` is inside the signed
    canonical string, so skewed time ⇒ auth failures. Both installers
    enable `systemd-timesyncd` for this reason.
-9. **The shipped unit uses `--no-passphrase`** — the vault is sealed with
+8. **The shipped unit uses `--no-passphrase`** — the vault is sealed with
    an empty passphrase and relies on filesystem permissions. Deliberate
    (documented in SECURITY.md) but it is the default posture.
+9. **`daemon.log` is created 0644; `audit.log` 0640.** Both live in a
+   0750 directory, so neither is world-readable, but the difference is
+   implicit rather than enforced — there is no `chmod` for `daemon.log`.
 
 ## Paths
 
@@ -148,7 +174,10 @@ landed before acting on them.
   `scripts/autoduo`, `scripts/install.sh` and `systemd/autoduo.service`
   hardcode `/opt/autoduo`.
 - Runtime data: vault `/var/lib/autoduo/vault.enc`, state
-  `/var/lib/autoduo/seen.json`, logs `/var/log/autoduo/`.
+  `/var/lib/autoduo/seen.json`, logs `/var/log/autoduo/` (instance
+  `default`); a named instance uses
+  `/var/lib/autoduo/instances/<name>/` and `/var/log/autoduo/<name>/`.
+  `autoduo.instances.resolve(name)` is the only place that decides this.
 - `scripts/install.sh` defaults `REPO_DIR=/opt/autoduo`; export
   `REPO_DIR` to point it at a checkout elsewhere.
 

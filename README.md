@@ -43,11 +43,40 @@ curl -fsSL https://raw.githubusercontent.com/maikokan/AutoDuo/main/install.sh | 
 ```bash
 git clone https://github.com/maikokan/AutoDuo.git /opt/autoduo
 cd /opt/autoduo
-sudo ./autoduo setup
+sudo scripts/autoduo setup
 ```
 
 AutoDuo installs to `/opt/autoduo/` with vault at `/var/lib/autoduo/`
 and logs at `/var/log/autoduo/`.
+
+---
+
+## Multiple accounts
+
+Duo enrolls one device per user, so each account is its own **instance**:
+its own vault, state file, log directory and systemd unit. Two accounts are
+two processes and neither can affect the other.
+
+```bash
+sudo autoduo setup --instance alice     # enrol, write the unit, start
+sudo systemctl enable --now autoduo@alice
+sudo autoduo instances                  # what is configured, and its state
+sudo autoduo watch                      # live view of every instance
+```
+
+Each named instance lives in its own directories:
+
+| | |
+|---|---|
+| vault | `/var/lib/autoduo/instances/<name>/vault.enc` |
+| state | `/var/lib/autoduo/instances/<name>/seen.json` |
+| logs | `/var/log/autoduo/<name>/{daemon,audit}.log` |
+| unit | `autoduo@<name>.service` |
+
+An instance called `default` uses the original paths
+(`/var/lib/autoduo/vault.enc`), so an existing install needs no migration.
+A second copy of the same instance refuses to start and exits 5 rather than
+approving pushes twice.
 
 ---
 
@@ -56,17 +85,20 @@ and logs at `/var/log/autoduo/`.
 ```
 autoduo setup       Interactive setup with disclaimer (first run)
 autoduo install     Install systemd service (no disclaimer, for scripts)
-autoduo uninstall   Remove systemd service and data
+autoduo uninstall   Remove one instance (--all removes everything)
 autoduo enroll      One-shot enroll with a Duo activation URL
 autoduo start       Start the daemon
 autoduo stop        Stop the daemon
 autoduo restart     Restart the daemon
 autoduo status      Show daemon status
 autoduo logs        Tail live logs (Ctrl+C to stop)
+autoduo instances   List every instance and its state
+autoduo watch       Live dashboard of all instances
 autoduo version     Print version
 ```
 
-All commands require root (`sudo`).
+Every command takes `--instance NAME` (before or after the verb) and
+defaults to `default`. All commands require root (`sudo`).
 
 ---
 
@@ -93,8 +125,9 @@ API calls the real app makes.
 | `/var/log/autoduo/audit.log` | Redacted approval records (urgid, app, factor) |
 | `/var/log/autoduo/traffic.log` | HTTP traffic (opt-in, headers redacted, body SHA-256 only) |
 
-Sensitive fields (`akey`, `pkey`, authorization headers) are never
-logged in full. The audit log is mode 0640.
+A named instance keeps its logs in `/var/log/autoduo/<name>/`. Sensitive
+fields (`akey`, `pkey`, authorization headers) are never logged in full. The
+audit log is mode 0640 and its directory 0750.
 
 ---
 
