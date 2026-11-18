@@ -219,7 +219,24 @@ class DuoBotDaemon:
             self._emit("state_corrupt", error="not a dict")
             return
         self._seen.update(data)
+        self._tighten_state_mode(p)
         self._emit("state_loaded", entries=len(self._seen))
+
+    def _tighten_state_mode(self, p: pathlib.Path) -> None:
+        """Make an inherited state file as private as a freshly written one.
+
+        ``mkstemp`` protects only what this build writes. A state file left
+        by an older build can be group- or world-readable, and it is not
+        rewritten until the next approval -- which on a quiet account can be
+        days. One chmod at load is cheaper than rewriting the file on a
+        timer just to fix a mode.
+        """
+        try:
+            if p.stat().st_mode & 0o077:
+                p.chmod(0o600)
+                self._emit("state_mode_tightened")
+        except OSError as e:
+            self._emit("state_mode_error", error=str(e))
 
     def _save_seen_state(self) -> None:
         if self._state_path is None:

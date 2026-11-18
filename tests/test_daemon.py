@@ -861,3 +861,53 @@ def test_independent_vaults_have_independent_locks(tmp_path, monkeypatch):
         import os
         os.close(fd_b)
     assert rc == 0
+
+def test_a_world_readable_state_file_is_tightened_on_load(
+        tmp_path, fake_clock, fake_sleep, log_capture):
+    """An inherited mode is not a promise this build gets to keep.
+
+    ``mkstemp`` makes new state files 0600, but a file written by an older
+    build stays as it was until the next approval -- which on a quiet
+    account can be days. Loading it is the one moment we know it exists.
+    """
+    clock, _ = fake_clock
+    state_path = tmp_path / "seen.json"
+    state_path.write_text(json.dumps({"u1": clock().isoformat()}))
+    state_path.chmod(0o644)
+
+    daemon.DuoBotDaemon(
+        client=FakeDeviceClient(),
+        poll_interval=5,
+        push_ttl=60,
+        log_stream=log_capture,
+        clock=clock,
+        sleep=fake_sleep[0],
+        state_path=state_path,
+        max_auth_failures=5,
+        auth_failure_window=300,
+    )
+
+    assert state_path.stat().st_mode & 0o777 == 0o600
+    assert "state_mode_tightened" in log_capture.getvalue()
+
+
+def test_an_already_private_state_file_is_left_alone(
+        tmp_path, fake_clock, fake_sleep, log_capture):
+    clock, _ = fake_clock
+    state_path = tmp_path / "seen.json"
+    state_path.write_text("{}")
+    state_path.chmod(0o600)
+
+    daemon.DuoBotDaemon(
+        client=FakeDeviceClient(),
+        poll_interval=5,
+        push_ttl=60,
+        log_stream=log_capture,
+        clock=clock,
+        sleep=fake_sleep[0],
+        state_path=state_path,
+        max_auth_failures=5,
+        auth_failure_window=300,
+    )
+
+    assert "state_mode_tightened" not in log_capture.getvalue()
