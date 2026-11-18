@@ -1,437 +1,446 @@
-"""The dashboard: one card per instance, a push feed, and a safe terminal.
+"""Tests for the live dashboard: total rendering and a terminal left clean.
 
-Every test builds its own rows instead of importing :mod:`autoduo.instances`:
-the dashboard duck-types the seam, so these tests hold it to that contract
-even while the instance module is still moving.
+The dashboard is fed fake instance statuses and a fake stream, so the whole
+suite stays offline and deterministic. Every frame is also checked against
+the width budget, because a card that wraps is a card an operator cannot
+read at a glance.
 """
 import io
-import pathlib
 import re
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-
-import pytest
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from autoduo import dashboard, ui
 
-NOW = datetime(2026, 11, 18, 12, 0, 0)
-ANSI = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
-@dataclass(frozen=True)
-class FakePaths:
-    name: str
-    vault: pathlib.Path = pathlib.Path("/tmp/autoduo/vault.enc")
-    state: pathlib.Path = pathlib.Path("/tmp/autoduo/seen.json")
-    lock: pathlib.Path = pathlib.Path("/tmp/autoduo/vault.lock")
-    daemon_log: pathlib.Path = pathlib.Path("/tmp/autoduo/daemon.log")
-    audit_log: pathlib.Path = pathlib.Path("/tmp/autoduo/audit.log")
-    legacy: bool = False
+class _Tty(io.StringIO):
+    """A stream a terminal could plausibly be."""
+
+    def isatty(self):
+        return True
 
 
-@dataclass
-class FakeStatus:
-    paths: FakePaths
-    state: str
-    last_event: str | None = None
-    last_event_at: str | None = None
-    last_approval_at: str | None = None
-    approvals_24h: int = 0
-    pending: int = 0
-    error: str | None = None
-
-
-def status(name="alice", state="running", *, approvals=0, pending=0,
-           last_approval_at=None, last_event=None, last_event_at=None,
-           error=None):
-    return FakeStatus(
-        paths=FakePaths(name),
-        state=state,
-        last_event=last_event,
-        last_event_at=last_event_at,
-        last_approval_at=last_approval_at,
-        approvals_24h=approvals,
-        pending=pending,
-        error=error,
-    )
-
-
-def iso(moment):
-    return moment.isoformat()
-
-
-def clean_env(monkeypatch, term="xterm-256color", force=None, no_color=None,
-              colorterm=None):
-    for name, value in (("NO_COLOR", no_color), ("FORCE_COLOR", force),
-                        ("COLORTERM", colorterm), ("TERM", term)):
+def _env(monkeypatch, term="xterm-256color", force=None, no_color=None,
+         columns=None):
+    """Pin every colour and geometry input for one test."""
+    setting = {"TERM": term, "FORCE_COLOR": force, "NO_COLOR": no_color,
+               "COLORTERM": None, "COLUMNS": columns}
+    for name, value in setting.items():
         if value is None:
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
 
 
-def frame(rows, **kwargs):
-    """Render once, plainly, at a fixed "now"."""
-    buf = io.StringIO()
-    text = dashboard.render(rows, stream=buf, now=NOW, **kwargs)
-    assert buf.getvalue() == "", "render returns the frame; it does not print it"
-    return text
+def _ago(**age):
+    moment = datetime.now(timezone.utc) - timedelta(**age)
+    return moment.isoformat()
 
 
-def plain(text):
-    return ANSI.sub("", text)
-
-
-def card_line(text, name):
-    """The first line of ``name``'s card (the name is bold, the line plain)."""
-    for line in plain(text).splitlines():
-        if line.startswith("  ") and name in line:
-            return line
-    raise AssertionError(f"no card line for {name!r}")
-
-
-class FakeTTY(io.StringIO):
-    """A buffer that claims to be a terminal, so the live path can run."""
-
-    def isatty(self):
-        return True
-
-
-# --- one-shot, plain ------------------------------------------------------
-
-def test_one_shot_is_plain_and_returns_zero(monkeypatch):
-    clean_env(monkeypatch)
-    buf = io.StringIO()
-    assert dashboard.run(lambda: [status(approvals=3)], stream=buf) == 0
-    out = buf.getvalue()
-    assert "\033" not in out
-    assert "alice" in out
-    assert "running" in out
-    assert "3 approvals today" in out
-    assert out.endswith("\n")
-
-
-def test_no_color_on_a_terminal_still_gets_one_plain_frame(monkeypatch):
-    clean_env(monkeypatch, no_color="1")
-    buf = FakeTTY()
-    assert dashboard.run(lambda: [status()], stream=buf) == 0
-    out = buf.getvalue()
-    assert "\033" not in out
-    assert "alice" in out
-
-
-def test_once_on_a_terminal_has_no_cursor_codes(monkeypatch):
-    clean_env(monkeypatch)
-    buf = FakeTTY()
-    assert dashboard.run(lambda: [status()], once=True, stream=buf) == 0
-    out = buf.getvalue()
-    assert "\033[?1049" not in out
-    assert "\033[?25" not in out
-    assert "alice" in out
-
-
-# --- header ---------------------------------------------------------------
-
-def test_totals_count_instances_running_and_approvals():
-    out = frame([
-        status(approvals=2),
-        status("bob", "stopped"),
-        status("carol", "failed", approvals=1),
-    ])
-    header = plain(out).splitlines()[0]
-    assert "3 instances" in header
-    assert "1 running" in header
-    assert "3 approvals today" in header
-
-
-def test_approvals_read_singular_for_one():
-    assert "1 approval today" in frame([status(approvals=1)])
-
-
-# --- every state ----------------------------------------------------------
-
-@pytest.mark.parametrize("state,words", [
-    ("running", "running"),
-    ("stopped", "stopped"),
-    ("failed", "failed"),
-    ("unknown", "unknown"),
-    ("no-vault", "not enrolled"),
-])
-def test_every_state_is_named_in_words(state, words):
-    out = frame([status("alice", state=state)])
-    assert words in card_line(out, "alice")
-
-
-def test_no_vault_says_what_to_run():
-    out = plain(frame([status("dave", "no-vault")]))
-    assert "not enrolled" in out
-    assert "autoduo setup" in out
-    assert "pending" not in out
-
-
-def test_unknown_without_an_error_explains_itself():
-    out = plain(frame([status("erin", "unknown")]))
-    assert "unknown" in card_line(out, "erin")
-    assert "could not read its status" in out
-
-
-# --- errors ---------------------------------------------------------------
-
-def test_an_error_is_one_truncated_warning_line(monkeypatch):
-    clean_env(monkeypatch, force="1", colorterm="truecolor")
-    error = (
-        'Traceback (most recent call last):\n'
-        '  File "daemon.py", line 1, in <module>\n'
-        "ValueError: vault is locked and the daemon cannot sign "
-        + "x" * 500
+def _row(name="work", **overrides):
+    fields = dict(
+        paths=SimpleNamespace(name=name),
+        state="running",
+        last_event="approve_ok",
+        last_event_at=None,
+        last_approval_at=None,
+        approvals_24h=0,
+        pending=0,
+        error=None,
     )
-    out = frame([status("carol", "failed", error=error)], width=68)
-    assert "Traceback" not in out
-    assert "vault is locked" in out
-    assert "\033[38;5;179m" in out   # muted amber, the warning tone
-    assert "\033[31m" not in out     # never bright red
-    error_line = next(line for line in plain(out).splitlines() if "error" in line)
-    assert error_line.endswith("…")
-    assert max(len(line) for line in plain(out).splitlines()) <= 68
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
 
 
-def test_an_error_is_shown_even_when_the_instance_is_running():
-    out = plain(frame([status(error="daemon.log: permission denied")]))
-    assert "permission denied" in out
-    assert "running" in card_line(out, "alice")
-
-
-def test_a_row_with_no_paths_or_bad_timestamps_still_draws():
-    row = status(last_approval_at="not a time", last_event_at="???")
-    row.paths = None
-    out = plain(frame([row]))
-    assert "unnamed" in out
-    assert "running" in out
-
-
-# --- recency --------------------------------------------------------------
-
-def test_a_running_instance_quiet_for_over_a_week_says_so():
-    out = plain(frame([status(last_approval_at=iso(NOW - timedelta(days=9)))]))
-    assert "quiet for 9 days" in out
-    assert "running" in card_line(out, "alice")
-
-
-def test_a_running_instance_within_a_week_is_not_quiet():
-    out = plain(frame([status(last_approval_at=iso(NOW - timedelta(days=6)))]))
-    assert "quiet for" not in out
-    assert "6 days ago" in out
-
-
-def test_a_stopped_instance_reads_as_no_approval_in_days():
-    out = plain(frame([
-        status("bob", "stopped", last_approval_at=iso(NOW - timedelta(days=4))),
-    ]))
-    assert "no approval in 4 days" in out
-
-
-def test_relative_ages_stay_short():
-    out = plain(frame([
-        status(last_approval_at=iso(NOW - timedelta(hours=2))),
-    ]))
-    assert "2h ago" in out
-
-
-# --- width and names ------------------------------------------------------
-
-def test_a_long_name_is_truncated_in_the_middle():
-    name = "production-laptop-for-the-night-shift-2026"
-    out = frame([status(name)], width=68)
-    line = card_line(out, "production")
-    assert "…" in line
-    assert "production" in line
-    assert "2026" in line
-    assert name not in plain(out)
-    assert max(len(line) for line in plain(out).splitlines()) <= 68
-
-
-@pytest.mark.parametrize("columns", [30, 40, 59, 60, 67, 68])
-def test_no_line_passes_the_width(columns):
-    rows = [
-        status("a-very-long-instance-name-for-the-night-shift",
-               approvals=1234, pending=2,
-               last_approval_at=iso(NOW - timedelta(minutes=5)),
-               last_event="heartbeat", last_event_at=iso(NOW)),
-        status("bob", "stopped",
-               last_approval_at=iso(NOW - timedelta(days=12))),
-        status("carol", "failed", pending=1,
-               error="vault is locked; run autoduo setup"),
-    ]
-    out = frame(rows, width=columns)
-    assert max(len(line) for line in plain(out).splitlines()) <= columns
-
-
-def test_colour_never_changes_the_measured_width(monkeypatch):
-    clean_env(monkeypatch, force="1", colorterm="truecolor")
-    rows = [status("a-very-long-instance-name", approvals=12,
-                   last_approval_at=iso(NOW - timedelta(minutes=2)),
-                   pending=1, last_event="heartbeat",
-                   last_event_at=iso(NOW))]
-    out = frame(rows, width=68)
-    assert "\033[" in out
-    assert max(len(line) for line in plain(out).splitlines()) <= 68
-
-
-def test_under_sixty_columns_the_card_stacks():
-    out = plain(frame([status(approvals=3,
-                              last_approval_at=iso(NOW - timedelta(hours=2)),
-                              last_event="heartbeat",
-                              last_event_at=iso(NOW))], width=48))
-    lines = out.splitlines()
-    start = next(i for i, line in enumerate(lines) if "alice" in line)
-    assert lines[start].strip() == "alice"
-    assert lines[start + 1].strip().startswith("running")
-    assert "3 approvals today" in lines[start + 1]
-    assert "last approval" in out
-    assert max(len(line) for line in lines) <= 48
-
-
-def test_the_state_column_lines_up():
-    out = plain(frame([
-        status("alice", "running", approvals=1),
-        status("bob", "stopped"),
-        status("carol", "failed"),
-    ], width=68))
-    positions = []
-    for name, word in (("alice", "running"), ("bob", "stopped"), ("carol", "failed")):
-        line = next(l for l in out.splitlines() if l.startswith("  ") and name in l)
-        positions.append(line.index(word))
-    assert len(set(positions)) == 1
-
-
-# --- empty state ----------------------------------------------------------
-
-def test_zero_instances_is_a_helpful_empty_screen():
-    out = plain(frame([]))
-    assert "autoduo" in out
-    assert "no instances yet" in out
-    assert "No instances yet." in out
-    assert "autoduo setup" in out
-    assert out.strip() != "autoduo"
-
-
-# --- the feed -------------------------------------------------------------
-
-def test_the_feed_is_newest_first_and_capped():
-    rows = [
-        status(f"i{index}", approvals=1,
-               last_approval_at=iso(NOW - timedelta(minutes=10 * index)))
-        for index in range(10)
-    ]
-    out = plain(frame(rows, width=68))
-    feed = out.split("recent approvals", 1)[1]
-    lines = [line for line in feed.splitlines() if "approved" in line]
-    assert len(lines) == dashboard.FEED_LIMIT
-    for index in range(dashboard.FEED_LIMIT):
-        assert f"i{index}" in lines[index]
-    assert "i8" not in feed and "i9" not in feed
-    assert lines[0].strip().startswith("12:00")
-
-
-def test_the_feed_invents_nothing_without_approvals():
-    out = plain(frame([status()]))
-    assert "recent approvals" in out
-    assert "no approvals in the last 24 hours" in out
-    assert "approved" not in out
-
-
-def test_the_feed_ignores_approvals_older_than_a_day():
-    out = plain(frame([status(last_approval_at=iso(NOW - timedelta(days=3)))]))
-    assert "no approvals in the last 24 hours" in out
-
-
-# --- terminal behaviour ---------------------------------------------------
-
-def test_the_first_provider_failure_returns_one_without_a_traceback():
-    def boom():
-        raise RuntimeError("systemctl is missing")
-
+def _frame(rows, monkeypatch, **env):
+    """The plain single-frame path, as a list of lines."""
+    _env(monkeypatch, **env)
     buf = io.StringIO()
-    assert dashboard.run(boom, stream=buf) == 1
-    out = buf.getvalue()
-    assert "Traceback" not in out
-    assert "systemctl is missing" in out
-    assert "\033" not in out
+    code = dashboard.run(rows, stream=buf)
+    assert code == 0
+    return buf.getvalue().splitlines()
 
 
-def test_a_later_failure_keeps_the_last_rows_and_says_so(monkeypatch):
-    clean_env(monkeypatch)
-    calls = []
-
-    def flaky():
-        calls.append(1)
-        if len(calls) == 1:
-            return [status(approvals=2)]
-        if len(calls) == 2:
-            raise RuntimeError("status check blew up")
-        raise KeyboardInterrupt
-
-    buf = FakeTTY()
-    assert dashboard.run(flaky, refresh=0, stream=buf) == 0
-    out = plain(buf.getvalue())
-    assert "status check failed" in out
-    assert "status check blew up" in out
-    assert out.count("alice") >= 2
+def _plain(lines):
+    return [ANSI.sub("", line) for line in lines]
 
 
-def test_the_alt_screen_is_restored_on_keyboard_interrupt(monkeypatch):
-    clean_env(monkeypatch)
-    calls = []
-
-    def provider():
-        calls.append(1)
-        if len(calls) == 1:
-            return [status(approvals=1)]
-        raise KeyboardInterrupt
-
-    buf = FakeTTY()
-    assert dashboard.run(provider, refresh=0, stream=buf) == 0
-    out = buf.getvalue()
-    assert out.startswith("\033[?1049h\033[?25l")
-    assert out.endswith("\033[?25h\033[?1049l")
+def _fits(lines, width=80):
+    for line in lines:
+        assert len(ANSI.sub("", line)) <= width, repr(line)
 
 
-def test_the_alt_screen_is_restored_when_rendering_raises(monkeypatch):
-    clean_env(monkeypatch)
-    real = dashboard.render
-    calls = {"count": 0}
-
-    def broken(*args, **kwargs):
-        calls["count"] += 1
-        if calls["count"] == 2:
-            raise ValueError("frame failed")
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(dashboard, "render", broken)
-    buf = FakeTTY()
-    with pytest.raises(ValueError):
-        dashboard.run(lambda: [status()], refresh=0, stream=buf)
-    assert buf.getvalue().endswith("\033[?25h\033[?1049l")
+def _display_width(text):
+    total = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return total
 
 
-# --- palette --------------------------------------------------------------
+# --- the empty screen -----------------------------------------------------
 
-def test_forced_colour_uses_duos_green(monkeypatch):
-    clean_env(monkeypatch, force="1", colorterm="truecolor")
-    out = frame([status(approvals=1)])
-    assert "\033[38;5;77" in out
-
-
-def test_brand_green_falls_back_with_the_terminal(monkeypatch):
-    clean_env(monkeypatch, term="screen")
-    assert ui.duo_green_code() == "38;5;71"
-    clean_env(monkeypatch, term="xterm")
-    assert ui.duo_green_code() == "32"
+def test_no_instances_is_one_calm_line_and_the_command(monkeypatch):
+    lines = _frame([], monkeypatch)
+    text = "\n".join(_plain(lines))
+    assert "No accounts are set up yet." in text
+    assert "autoduo setup" in text
+    assert "error" not in text.lower()
+    _fits(lines)
 
 
-def test_state_words_are_plain_without_colour(monkeypatch):
-    clean_env(monkeypatch)
+def test_an_empty_callable_is_the_same_screen(monkeypatch):
+    lines = _frame(lambda: [], monkeypatch)
+    assert "No accounts are set up yet." in "\n".join(_plain(lines))
+
+
+# --- a card ---------------------------------------------------------------
+
+def test_running_instance_shows_a_fresh_approval(monkeypatch):
+    item = _row(last_approval_at=_ago(minutes=2), last_event_at=_ago(minutes=2),
+                approvals_24h=3)
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "work" in text
+    assert "running" in text
+    assert "approved 2m ago" in text
+    assert "3 in 24h · 0 pending" in text
+    assert "last event  approve_ok · 2m ago" in text
+
+
+def test_pending_pushes_are_counted(monkeypatch):
+    item = _row(pending=2, approvals_24h=1)
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "1 in 24h · 2 pending" in text
+
+
+def test_stopped_instance_still_names_its_state(monkeypatch):
+    item = _row(name="personal", state="stopped", last_approval_at=_ago(days=3))
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "personal" in text
+    assert "stopped" in text
+    assert "quiet" not in text  # quiet is a running account's story
+
+
+def test_no_vault_and_unknown_read_as_words(monkeypatch):
+    rows = [_row(name="fresh", state="no-vault"),
+            _row(name="odd", state="something-else")]
+    text = "\n".join(_plain(_frame(rows, monkeypatch)))
+    assert "no vault" in text
+    assert "something-else" in text
+
+
+def test_failed_instance_says_so_and_points_at_the_log(monkeypatch):
+    item = _row(name="broken", state="failed")
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "failed" in text
+    assert "see the service log" in text
+
+
+def test_an_error_is_a_dim_note_not_fake_zeros(monkeypatch):
+    item = _row(name="locked", state="unknown",
+                error="cannot read log: permission denied")
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "cannot read log: permission denied" in text
+    assert "0 in 24h" not in text
+    assert "0 pending" not in text
+
+
+def test_an_over_long_error_is_clipped(monkeypatch):
+    item = _row(error="x" * 500)
+    lines = _frame([item], monkeypatch)
+    _fits(lines)
+    assert "…" in "\n".join(_plain(lines))
+
+
+# --- time -----------------------------------------------------------------
+
+def test_an_iso_timestamp_far_in_the_past_is_humanised(monkeypatch):
+    item = _row(last_approval_at="2020-01-01T00:00:00Z")
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "quiet · last approval" in text
+    assert re.search(r"\d+(y|mo) ago", text), text
+
+
+def test_a_naive_timestamp_is_read_as_utc(monkeypatch):
+    item = _row(last_approval_at=_ago(hours=2)[:-6])  # drop the +00:00
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "approved 2h ago" in text
+
+
+def test_an_unparseable_timestamp_stays_calm(monkeypatch):
+    item = _row(last_approval_at="last tuesday", last_event_at="???")
+    lines = _frame([item], monkeypatch)
+    text = "\n".join(_plain(lines))
+    assert "last approval time unreadable" in text
+    assert "last event  approve_ok" in text
+    _fits(lines)
+
+
+def test_a_running_instance_older_than_six_hours_is_quiet(monkeypatch):
+    item = _row(last_approval_at=_ago(hours=8), approvals_24h=0)
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "quiet · last approval 8h ago" in text
+    assert "failed" not in text
+    assert "error" not in text.lower()
+
+
+def test_a_recent_approval_is_not_called_quiet(monkeypatch):
+    item = _row(last_approval_at=_ago(minutes=5))
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "quiet" not in text
+
+
+def test_no_approval_yet_is_not_a_failure(monkeypatch):
+    text = "\n".join(_plain(_frame([_row()], monkeypatch)))
+    assert "no approvals yet" in text
+    assert "failed" not in text
+
+
+# --- hostile data ---------------------------------------------------------
+
+def test_a_200_character_name_is_truncated(monkeypatch):
+    item = _row(name="account-" + "z" * 200)
+    lines = _frame([item], monkeypatch)
+    _fits(lines)
+    joined = "\n".join(_plain(lines))
+    assert "…" in joined
+    assert "z" * 200 not in joined
+
+
+def test_control_characters_and_ansi_are_stripped(monkeypatch):
+    item = _row(name="\x1b[31mred\x1b[0m\x07bad\nname")
+    lines = _frame([item], monkeypatch)
+    text = "\n".join(_plain(lines))
+    assert "red bad name" in text
+    assert "\x1b[31m" not in text
+    assert "\x07" not in text
+
+
+def test_wide_characters_do_not_pass_the_width(monkeypatch):
+    item = _row(name="\u5de5\u4f5c\u30a2\u30ab\u30a6\u30f3\u30c8" * 12)
+    lines = _frame([item], monkeypatch)
+    for line in _plain(lines):
+        assert _display_width(line) <= 80, repr(line)
+
+
+def test_missing_and_none_rows_do_not_raise(monkeypatch):
+    lines = _frame([SimpleNamespace(), None], monkeypatch)
+    text = "\n".join(_plain(lines))
+    assert "unnamed" in text
+    assert "unknown" in text
+    _fits(lines)
+
+
+def test_mapping_rows_are_accepted(monkeypatch):
+    rows = [{"paths": {"name": "mapped"}, "state": "running",
+             "approvals_24h": 2, "pending": 0}]
+    text = "\n".join(_plain(_frame(rows, monkeypatch)))
+    assert "mapped" in text
+    assert "2 in 24h" in text
+
+
+# --- geometry -------------------------------------------------------------
+
+def test_a_narrow_terminal_narrows_the_frame(monkeypatch):
+    rows = [_row(name="work", last_approval_at=_ago(minutes=2)),
+            _row(name="personal", state="stopped")]
+    lines = _frame(rows, monkeypatch, columns="40")
+    _fits(lines, 40)
+
+
+def test_a_wide_terminal_still_stops_at_eighty(monkeypatch):
+    lines = _frame([_row()], monkeypatch, columns="200")
+    _fits(lines, 80)
+
+
+def test_a_broken_columns_variable_is_ignored(monkeypatch):
+    lines = _frame([_row()], monkeypatch, columns="wide")
+    _fits(lines, 80)
+
+
+def test_a_zero_column_terminal_is_not_a_blank_screen(monkeypatch):
+    # `script` and some CI ptys report 0 columns; a blank frame is no use.
+    lines = _frame([_row()], monkeypatch, columns="0")
+    _fits(lines, 80)
+    assert "work" in "\n".join(_plain(lines))
+
+
+def test_a_short_window_drops_cards_with_a_count(monkeypatch):
+    _env(monkeypatch)
+    rows = [_row(name=f"acct-{n}") for n in range(12)]
+    frame = dashboard._render(rows, 80, io.StringIO(), live=True, height=14)
+    plain = ANSI.sub("", "\n".join(frame))
+    assert "more" in plain
+    assert len(frame) <= 14
+
+
+def test_a_pipe_shows_every_account(monkeypatch):
+    rows = [_row(name=f"acct-{n}") for n in range(12)]
+    text = "\n".join(_plain(_frame(rows, monkeypatch)))
+    assert "acct-11" in text
+    assert "more" not in text
+
+
+# --- failures --------------------------------------------------------------
+
+def test_a_raising_callable_prints_one_dim_line(monkeypatch):
+    def broken():
+        raise RuntimeError("systemctl exploded")
+
+    _env(monkeypatch)
     buf = io.StringIO()
-    assert ui.state_word("no-vault", buf) == "not enrolled"
+    assert dashboard.run(broken, stream=buf) == 0
+    lines = buf.getvalue().splitlines()
+    text = "\n".join(_plain(lines))
+    assert "RuntimeError" in text
+    assert "systemctl exploded" in text
+    assert "Traceback" not in text
+    _fits(lines)
+
+
+def test_a_statuses_read_that_explodes_is_a_line(monkeypatch):
+    def broken():
+        raise OSError(13, "permission denied")
+
+    _env(monkeypatch)
+    buf = io.StringIO()
+    assert dashboard.run(broken, stream=buf) == 0
+    assert "permission denied" in buf.getvalue()
+
+
+# --- colour ---------------------------------------------------------------
+
+def test_a_plain_pipe_gets_no_escape_bytes(monkeypatch):
+    _env(monkeypatch)
+    buf = io.StringIO()
+    dashboard.run([_row()], stream=buf)
     assert "\033" not in buf.getvalue()
-    assert ui.state_label("stopped") == "stopped"
+
+
+def test_force_color_paints_a_pipe_as_asked(monkeypatch):
+    _env(monkeypatch, force="1", term="xterm-256color")
+    buf = io.StringIO()
+    dashboard.run([_row(last_approval_at=_ago(minutes=2))], stream=buf)
+    assert "\033[38;5;77m" in buf.getvalue()
+
+
+def test_no_color_means_a_plain_single_frame(monkeypatch):
+    out = _Tty()
+    _env(monkeypatch, force="1", no_color="1")
+    assert dashboard.run(lambda: [_row()], refresh=0.0, stream=out) == 0
+    text = out.getvalue()
+    assert "\033" not in text
+    assert text.count("autoduo") == 1  # exactly one frame, not a loop
+
+
+def test_the_accent_is_green_on_a_colour_terminal(monkeypatch):
+    _env(monkeypatch, force="1", term="xterm-256color")
+    buf = io.StringIO()
+    dashboard.run([_row(last_approval_at=_ago(minutes=2))], stream=buf)
+    text = buf.getvalue()
+    assert "\033[38;5;77m" in text          # the title and the approval
+    assert "approved 2m ago" in ANSI.sub("", text)
+
+
+def test_a_stopped_instance_is_not_painted_with_the_accent(monkeypatch):
+    _env(monkeypatch, force="1", term="xterm-256color")
+    buf = io.StringIO()
+    dashboard.run([_row(state="stopped")], stream=buf)
+    stopped = [line for line in buf.getvalue().splitlines()
+               if "stopped" in ANSI.sub("", line)][0]
+    assert "\033[38;5;77" not in stopped
+
+
+def test_duo_green_prefers_256_colour(monkeypatch):
+    _env(monkeypatch, force="1", term="xterm-256color")
+    assert ui.duo_green("x") == "\033[38;5;77mx\033[0m"
+
+
+def test_duo_green_falls_back_to_the_deeper_green(monkeypatch):
+    _env(monkeypatch, force="1", term="screen")
+    assert ui.duo_green("x") == "\033[38;5;71mx\033[0m"
+
+
+def test_duo_green_falls_back_to_simple_green(monkeypatch):
+    _env(monkeypatch, force="1", term="xterm")
+    assert ui.duo_green("x") == "\033[32mx\033[0m"
+
+
+def test_duo_green_can_be_bold_and_respects_no_color(monkeypatch):
+    _env(monkeypatch, force="1", term="xterm-256color")
+    assert ui.duo_green("x", strong=True) == "\033[38;5;77;1mx\033[0m"
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert ui.duo_green("x") == "x"
+
+
+# --- the live path ---------------------------------------------------------
+
+def test_interactive_restores_the_screen_after_ctrl_c(monkeypatch):
+    out = _Tty()
+    _env(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    calls = []
+
+    def statuses():
+        calls.append(1)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+        return [_row()]
+
+    assert dashboard.run(statuses, refresh=0.0, stream=out) == 0
+    text = out.getvalue()
+    assert text.index("\033[?1049h") < text.index("\033[?1049l")
+    assert "\033[?25l" in text and "\033[?25h" in text
+    assert "work" in ANSI.sub("", text)
+    assert "q to quit" in ANSI.sub("", text)
+
+
+def test_interactive_asks_for_the_statuses_every_frame(monkeypatch):
+    out = _Tty()
+    _env(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    seen = []
+
+    def statuses():
+        seen.append(len(seen))
+        if len(seen) == 4:
+            raise KeyboardInterrupt
+        return [_row(name=f"account-{len(seen)}")]
+
+    assert dashboard.run(statuses, refresh=0.0, stream=out) == 0
+    assert len(seen) == 4
+    text = ANSI.sub("", out.getvalue())
+    assert "account-1" in text and "account-3" in text
+
+
+def test_interactive_keeps_the_last_good_frame_when_statuses_break(
+        monkeypatch):
+    out = _Tty()
+    _env(monkeypatch)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+    calls = []
+
+    def statuses():
+        calls.append(1)
+        if len(calls) == 1:
+            return [_row(name="steady")]
+        if len(calls) == 2:
+            raise RuntimeError("no systemctl")
+        raise KeyboardInterrupt
+
+    assert dashboard.run(statuses, refresh=0.0, stream=out) == 0
+    text = ANSI.sub("", out.getvalue())
+    assert "steady" in text
+    assert "RuntimeError" in text
+
+
+def test_an_odd_refresh_is_clamped_not_fatal(monkeypatch):
+    _env(monkeypatch)
+    buf = io.StringIO()
+    for value in (None, "often", float("nan"), -3, 10_000):
+        assert dashboard.run([_row()], refresh=value, stream=buf) == 0

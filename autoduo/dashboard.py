@@ -1,691 +1,662 @@
 """The live dashboard: one card per autoduo instance.
 
-A calm screen for one question -- "is my phone-free login working right
-now?" -- not a metrics board.  Each card leads with the instance's state,
-then the facts that answer whether it is doing its job: the last approval,
-what is pending, and the last thing that happened.
+Every account runs as its own process with its own vault and logs, so the
+honest screen is a stack of cards rather than one blended status. A card
+carries the account name, its state in a word, today's approvals, how long
+ago the last push was approved, how many entries are still pending, and the
+last event with its age.
 
-The frame is built as one string and written in one call.  On a terminal
-that means the alternate screen and a redraw in place, never a flicker;
-in a pipe, in a test, or under ``NO_COLOR`` it means exactly one plain
-frame and exit, with no cursor codes at all.
+The look borrows Duo Mobile's green on near-black. A terminal colours the
+ink, not the background, so the palette becomes a single green accent
+(:func:`autoduo.ui.duo_green`): the title, a running instance, and a fresh
+approval. Nothing else is coloured, every state is still spelled out, so a
+pipe, ``NO_COLOR`` or a colour-blind operator loses nothing. No boxes, no
+emoji, no reversed video, and at most one hairline rule on the screen.
 
-Colour follows :mod:`autoduo.ui` (``NO_COLOR`` first, then ``FORCE_COLOR``,
-then a TTY).  Duo's green is the accent and it means "alive": the wordmark
-and the word ``running``.  A stopped instance is dim, an unknown one is
-amber, and a failed one is muted red -- never bright red, never reverse
-video, never a background.
+A running account with no approval for hours is *quiet*, not broken: low
+traffic is healthy, and alarming an operator about a healthy account is the
+mistake this project keeps making. So the card says "quiet" and keeps the
+age instead of hinting at failure.
+
+Two output paths, chosen per call:
+
+  * not a TTY, ``NO_COLOR`` set, or a pipe -> exactly one plain frame,
+    complete, however many accounts there are;
+  * a TTY -> redraw in place on the alternate screen with the cursor
+    hidden, and restore both in a ``finally`` so Ctrl+C cannot wreck the
+    terminal. Quit with ``q`` or Ctrl+C. The frame is cut to the height of
+    the window with a quiet "… N more" line, since the alt screen cannot
+    scroll.
+
+``statuses`` is a callable returning the list of instance statuses from
+:mod:`autoduo.instances`, or a plain list. A callable is used so systemd is
+asked once per frame, not once per card. It may raise: the dashboard keeps
+the last good frame and adds one dim line naming the error.
+
+Everything drawn from logs, timestamps and names is untrusted input. ANSI
+escapes and control characters are stripped, wide characters are measured
+as two columns, and no line ever passes the terminal's own width or 80
+columns, whichever is smaller.
 """
 from __future__ import annotations
 
+import os
+import re
+import select
 import shutil
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Iterable, TextIO
+import unicodedata
+from collections.abc import Mapping
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, TextIO
 
 from . import ui
 
-if TYPE_CHECKING:  # the seam lives in instances.py, which lands separately
-    from .instances import InstanceStatus
+try:  # POSIX only; without it, Ctrl+C still quits.
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - the project is Linux-only
+    termios = None
+    tty = None
 
-__all__ = ["render", "run"]
+MAX_WIDTH = 80              # never wider than this, even on a huge terminal
+MAX_LINES = 40              # a taller frame than this is not a dashboard
+FALLBACK_COLUMNS = 80
+FALLBACK_LINES = 24
+INDENT = "  "
+QUIET_AFTER = 6 * 3600      # an older approval is quiet, not broken
+MAX_INTERVAL = 60.0         # a sanity cap on the refresh argument
 
-Segment = tuple[str, str | None]
-Line = list[Segment]
-
-WIDE_MIN = 60            # below this the card stacks instead of using columns
-LABEL_PAD = 15           # "last approval" plus two spaces
-FEED_LIMIT = 8
-QUIET_DAYS = 7
-DAY = 86_400
-
-_ALT_ON = "\033[?1049h"
-_ALT_OFF = "\033[?1049l"
-_HIDE_CURSOR = "\033[?25l"
-_SHOW_CURSOR = "\033[?25h"
+_ENTER = "\033[?1049h\033[?25l"     # alternate screen, cursor hidden
+_LEAVE = "\033[?25h\033[?1049l"     # cursor back, original screen back
 _HOME = "\033[H"
+_CLEAR_LINE = "\033[2K"
 _CLEAR_BELOW = "\033[J"
 
-# daemon.log carries snake_case event names; a person should not have to read
-# them.  Anything not listed is un-cased, never guessed at.
-_EVENT_WORDS = {
-    "heartbeat": "heartbeat",
-    "approve_ok": "approved",
-    "approve_rejected": "approval refused",
-    "approve_auth_error": "approval auth failed",
-    "daemon_starting": "started",
-    "daemon_stopped": "stopped",
-    "tx_seen": "push seen",
-    "tx_deduped": "push already handled",
-    "rate_limited": "rate limited",
-    "auth_error": "authentication failed",
-    "circuit_open": "paused after auth failures",
-    "circuit_closed": "resumed",
-    "state_loaded": "state loaded",
-    "state_saved": "state saved",
+_STATES = {
+    "running": "running",
+    "stopped": "stopped",
+    "failed": "failed",
+    "no-vault": "no vault",
+    "unknown": "unknown",
 }
 
-
-# --------------------------------------------------------------------------
-# small text helpers
-
-def _paint(text: str, tone: str | None, stream: TextIO | None) -> str:
-    """One segment in a named tone; ``None`` leaves the terminal's own ink."""
-    if not text or tone is None:
-        return text
-    if tone == "dim":
-        return ui.dim(text, stream)
-    if tone == "bold":
-        return ui.bold(text, stream)
-    if tone == "brand":
-        return ui.duo_green(text, stream)
-    if tone == "brand-strong":
-        return ui.duo_green(text, stream, strong=True)
-    return ui.paint(text, tone, stream=stream)
+# CSI, OSC and two-byte escapes: enough to remove anything a log can smuggle
+# in, including the partial sequence a rotating file leaves behind.
+_ANSI = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|[@-Z\\-_])"
+)
+# Everything unprintable except tab and newline, which become one space.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_ZERO_WIDTH = frozenset("\u200b\u200c\u200d\ufeff")
 
 
-def _seg_width(segs: Iterable[Segment]) -> int:
-    """Visible width: painted text never counts its escape sequences."""
-    return sum(len(text) for text, _ in segs)
+# --- styling --------------------------------------------------------------
+# Roles are named here and painted by ui, so the palette has one source.
+
+def _dim(stream: TextIO):
+    return lambda text: ui.dim(text, stream)
 
 
-def _render(line: Line, stream: TextIO | None) -> str:
-    """Paint a line, merging neighbours in the same tone into one escape run."""
-    merged: Line = []
-    for text, tone in line:
-        if not text:
-            continue
-        if merged and merged[-1][1] == tone:
-            merged[-1] = (merged[-1][0] + text, tone)
-        else:
-            merged.append((text, tone))
-    return "".join(_paint(text, tone, stream) for text, tone in merged)
+def _green(stream: TextIO):
+    return lambda text: ui.duo_green(text, stream)
 
 
-def _trim(segs: Line, limit: int) -> Line:
-    """Cut a line to ``limit`` visible cells, marking the cut with an ellipsis."""
-    if limit <= 0:
-        return []
-    if _seg_width(segs) <= limit:
-        return list(segs)
-    out: Line = []
-    room = limit - 1
-    used = 0
-    for text, tone in segs:
-        if used >= room:
-            break
-        take = min(len(text), room - used)
-        if take > 0:
-            out.append((text[:take], tone))
-            used += take
-    out.append(("…", out[-1][1] if out else None))
-    return out
+def _green_bold(stream: TextIO):
+    return lambda text: ui.duo_green(text, stream, strong=True)
 
 
-def _join(lines: Iterable[Line], stream: TextIO | None, width: int) -> str:
-    """The whole frame, one line per row, no line past ``width - 2``."""
-    edge = max(0, width - 2)
-    kept = list(lines)
-    while kept and not _seg_width(kept[-1]):
-        kept.pop()
-    body = "\n".join(_render(_trim(line, edge), stream) for line in kept)
-    return body + "\n"
+def _bold(stream: TextIO):
+    return lambda text: ui.bold(text, stream)
 
 
-def _ellipsis_middle(text: str, limit: int) -> str:
-    """``very-long-instance-name`` inside ``limit``, both ends kept."""
-    if limit <= 0:
-        return ""
-    text = " ".join(str(text).split())
-    if len(text) <= limit:
-        return text
-    if limit == 1:
-        return "…"
-    head = (limit - 1) // 2
-    tail = limit - 1 - head
-    return text[:head] + "…" + text[-tail:]
+def _state_style(state: str, stream: TextIO):
+    """Only ``running`` earns the accent; a failure earns weight, not colour."""
+    if state == "running":
+        return _green(stream)
+    if state == "failed":
+        return _bold(stream)
+    return _dim(stream)
 
 
-def _end_trim(text: str, limit: int) -> str:
-    """``text`` on one line, cut at the end: for prose, never for names."""
-    if limit <= 0:
-        return ""
-    text = " ".join(str(text).split())
-    if len(text) <= limit:
-        return text
-    if limit == 1:
-        return "…"
-    return text[: limit - 1].rstrip() + "…"
+# --- untrusted text -------------------------------------------------------
 
-
-# --------------------------------------------------------------------------
-# time
-
-def _terminal_width() -> int:
-    try:
-        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
-    except OSError:  # an exotic stream cannot answer
-        columns = 80
-    return max(1, min(int(columns), ui.MAX_WIDTH))
-
-
-def _parse_time(value: object) -> datetime | None:
-    """ISO 8601 (with or without ``Z``), epoch seconds, or nothing."""
+def _clean(value: Any, limit: int = 160) -> str:
+    """One safe line: no escapes, no control characters, no runaway length."""
     if value is None:
+        return ""
+    try:
+        text = value if isinstance(value, str) else str(value)
+    except Exception:  # an object whose __str__ is broken is not a crisis
+        return ""
+    text = _ANSI.sub("", text)
+    text = _CONTROL.sub(" ", text)
+    text = " ".join(text.split())
+    return _clip(text, limit)
+
+
+def _width(text: str) -> int:
+    """Columns the text occupies, counting a wide character as two."""
+    total = 0
+    for char in text:
+        if char in _ZERO_WIDTH or unicodedata.combining(char):
+            continue
+        total += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return total
+
+
+def _clip(text: str, limit: int) -> str:
+    """Shorten to ``limit`` columns with a single ellipsis."""
+    if limit <= 0:
+        return ""
+    if _width(text) <= limit:
+        return text
+    kept: list[str] = []
+    used = 0
+    for char in text:
+        char_width = _width(char)
+        if used + char_width > limit - 1:
+            break
+        kept.append(char)
+        used += char_width
+    return "".join(kept) + "…"
+
+
+def _screen_clip(text: str, limit: int) -> str:
+    """Last line of defence: keep visible columns within ``limit``.
+
+    Escapes have no width, so a painted line is measured the way the
+    terminal sees it. A clipped line is given a reset, since the one that
+    belonged to the text may have been cut off.
+    """
+    if limit <= 0:
+        return ""
+    kept: list[str] = []
+    used = 0
+    index = 0
+    while index < len(text):
+        if text[index] == "\x1b":
+            match = _ANSI.match(text, index)
+            if match:
+                kept.append(match.group(0))
+                index = match.end()
+                continue
+        char = text[index]
+        char_width = _width(char)
+        if used + char_width > limit:
+            kept.append("\033[0m")
+            return "".join(kept)
+        kept.append(char)
+        used += char_width
+        index += 1
+    return "".join(kept)
+
+
+def _row(left: str, right: str, width: int, left_style=None,
+         right_style=None) -> str:
+    """A left label and a right label on one line, never wider than ``width``."""
+    width = max(1, width)
+    right = _clip(right, max(0, width - 2))
+    room = width - _width(right) - 1
+    if right and room < 1:  # a narrow terminal: shrink the right side first
+        right = _clip(right, max(0, width - 2))
+        room = max(0, width - _width(right) - 1)
+    left = _clip(left, max(0, room))
+    head = left_style(left) if left_style else left
+    if not right:
+        return head
+    gap = max(0, width - _width(left) - _width(right))
+    tail = right_style(right) if right_style else right
+    return head + " " * gap + tail
+
+
+# --- times ----------------------------------------------------------------
+
+def _parse_time(value: Any) -> datetime | None:
+    """An ISO timestamp in UTC, or ``None`` when the text is not one."""
+    if not isinstance(value, str):
         return None
-    if isinstance(value, datetime):
-        moment = value
-    elif isinstance(value, (int, float)):
-        try:
-            moment = datetime.fromtimestamp(float(value))
-        except (OverflowError, OSError, ValueError):
-            return None
-    else:
-        text = str(value).strip()
-        if not text:
-            return None
-        try:
-            moment = datetime.fromtimestamp(float(text))
-        except ValueError:
-            if text.endswith(("Z", "z")):
-                text = text[:-1] + "+00:00"
-            try:
-                moment = datetime.fromisoformat(text)
-            except ValueError:
-                return None
-        except (OverflowError, OSError):
-            return None
-    if moment.tzinfo is not None:
-        moment = moment.astimezone()
-    return moment
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:  # the daemon writes UTC; assume it when unsaid
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
-def _age_seconds(value: object, now: datetime) -> float | None:
+def _seconds_since(value: Any, now: datetime) -> float | None:
     moment = _parse_time(value)
     if moment is None:
         return None
-    return max(0.0, now.timestamp() - moment.timestamp())
+    return max(0.0, (now - moment).total_seconds())
 
 
-def _human_age(seconds: float) -> str:
-    total = max(0, int(seconds))
-    if total < 60:
+def _humanise(seconds: float) -> str:
+    """``just now``, ``4m ago``, ``2h ago``, ``3d ago`` -- never a bare number."""
+    whole = int(max(0, seconds))
+    if whole < 45:
         return "just now"
-    minutes = total // 60
-    if minutes < 60:
-        return f"{minutes} min ago"
-    hours = total // 3600
+    minutes = max(1, int(round(whole / 60)))
+    if whole < 60 * 60:
+        return f"{minutes}m ago"
+    hours = max(1, int(round(whole / 3600)))
     if hours < 24:
         return f"{hours}h ago"
-    days = total // DAY
-    return "1 day ago" if days == 1 else f"{days} days ago"
+    days = max(1, int(round(whole / 86400)))
+    if days < 14:
+        return f"{days}d ago"
+    if days < 90:
+        return f"{max(2, int(round(days / 7)))}w ago"
+    months = max(3, int(round(days / 30)))
+    if months < 18:
+        return f"{months}mo ago"
+    return f"{max(1, int(round(days / 365)))}y ago"
 
 
-def _days_text(seconds: float) -> str:
-    days = max(1, int(seconds // DAY))
-    return "1 day" if days == 1 else f"{days} days"
+# --- reading one status ---------------------------------------------------
+# A field may be missing, None or of the wrong type. Every getter is total:
+# the dashboard runs on a host that may be broken, and a traceback would
+# hide every other instance.
 
-
-# --------------------------------------------------------------------------
-# one row, reduced to what the card shows
-
-@dataclass
-class _Summary:
-    name: str
-    state_label: str
-    state_tone: str
-    headline: tuple[str, str] | None
-    headline_short: str | None
-    sentence: tuple[str, str | None] | None
-    pending: int | None
-    facts: list[tuple[str, str, str | None]]
-
-
-def _state_of(row: object) -> str:
-    state = getattr(row, "state", None)
-    text = str(state).strip().lower() if state is not None else ""
-    return text or "unknown"
-
-
-def _name_of(row: object) -> str:
-    paths = getattr(row, "paths", None)
-    name = getattr(paths, "name", None)
-    text = " ".join(str(name).split()) if name is not None else ""
-    return text or "unnamed"
-
-
-def _int_of(row: object, field: str) -> int:
+def _attr(item: Any, name: str, default: Any = None) -> Any:
     try:
-        return max(0, int(getattr(row, field, 0)))
+        if isinstance(item, Mapping):
+            return item.get(name, default)
+        return getattr(item, name, default)
+    except Exception:
+        return default
+
+
+def _number(value: Any) -> int:
+    try:
+        return max(0, int(value))
     except (TypeError, ValueError):
         return 0
 
 
-def _approvals_text(count: int) -> str:
-    noun = "approval" if count == 1 else "approvals"
-    return f"{count} {noun} today"
+def _name_of(item: Any) -> str:
+    name = _attr(_attr(item, "paths"), "name") or _attr(item, "name")
+    return _clean(name, 120) or "unnamed"
 
 
-def _event_words(event: object) -> str:
-    if event is None:
-        return ""
-    text = " ".join(str(event).split())
-    if not text:
-        return ""
-    return _end_trim(_EVENT_WORDS.get(text, text.replace("_", " ")), 80)
+def _state_of(item: Any) -> str:
+    raw = _clean(_attr(item, "state"), 24).lower()
+    return _STATES.get(raw, raw or "unknown")
 
 
-def _event_text(row: object, now: datetime) -> str:
-    text = _event_words(getattr(row, "last_event", None))
-    moment = _parse_time(getattr(row, "last_event_at", None))
-    clock = ""
-    if moment is not None:
-        clock = moment.strftime("%H:%M")
-        if moment.date() != now.date():
-            clock = moment.strftime("%d %b %H:%M")
-    if text and clock:
-        return f"{text} at {clock}"
-    return text or clock
+# --- one card -------------------------------------------------------------
 
+def _approval_line(item: Any, state: str, now: datetime) -> tuple[str, str]:
+    """The card's headline: a fresh push, a quiet account, or nothing.
 
-def _tidy_error(error: object, limit: int | None = None) -> str:
-    """One line, no traceback frame, and never the whole stack."""
-    lines = [ln.strip() for ln in str(error or "").splitlines() if ln.strip()]
-    if lines and lines[0].startswith("Traceback ("):
-        text = lines[-1]  # the exception line names the actual fault
-    else:
-        text = " ".join(lines)
-    if not text:
-        text = "no detail given"
-    return _end_trim(text, limit) if limit else text
-
-
-def _summarise(row: object, now: datetime) -> _Summary:
-    state = _state_of(row)
-    label, tone = ui.state_style(state)
-    approvals = _int_of(row, "approvals_24h")
-    age = _age_seconds(getattr(row, "last_approval_at", None), now)
-    error = str(getattr(row, "error", "") or "").strip()
-    quiet = age is not None and age >= QUIET_DAYS * DAY
-
-    headline: tuple[str, str] | None = None
-    short: str | None = None
-    sentence: tuple[str, str | None] | None = None
-    pending: int | None = None
-    facts: list[tuple[str, str, str | None]] = []
-
+    Returns the words and a style key. A *running* account older than
+    ``QUIET_AFTER`` is healthy and says so; a stopped one simply has an old
+    approval, so it gets the plain age. Only an unreadable timestamp is
+    reported as unknown, and even that stays calm.
+    """
+    stamp = _attr(item, "last_approval_at")
+    elapsed = _seconds_since(stamp, now)
+    if elapsed is None:
+        if stamp in (None, ""):
+            return "no approvals yet", "dim"
+        return "last approval time unreadable", "dim"
+    age = _humanise(elapsed)
+    if elapsed > QUIET_AFTER:
+        if state == "running":
+            return f"quiet · last approval {age}", "plain"
+        return f"last approval {age}", "dim"
     if state == "running":
-        pending = _int_of(row, "pending")
-        if quiet:
-            headline = (f"quiet for {_days_text(age)}", "warning")
-        elif age is None:
-            headline = ("no approvals yet", "dim")
-        else:
-            headline = (_approvals_text(approvals), None)
-            short = f"{approvals} today"
-    elif state == "failed":
-        pending = _int_of(row, "pending")
-        if approvals:
-            headline = (_approvals_text(approvals), None)
-            short = f"{approvals} today"
-    elif state == "unknown":
-        pending = _int_of(row, "pending")
-        if approvals:
-            headline = (_approvals_text(approvals), None)
-            short = f"{approvals} today"
-        if not error:
-            sentence = ("could not read its status", "dim")
-    elif state == "stopped":
-        if age is not None and age >= DAY:
-            sentence = (f"no approval in {_days_text(age)}", None)
-        elif age is not None:
-            facts.append(("last approval", _human_age(age), None))
-    elif state == "no-vault":
-        sentence = ("run autoduo setup to enroll it", "dim")
+        return f"approved {age}", "green"
+    return f"last approval {age}", "dim"
 
-    if age is not None and state in ("running", "failed", "unknown") and not quiet:
-        facts.insert(0, ("last approval", _human_age(age), None))
+
+def _event_line(item: Any, now: datetime) -> str:
+    event = _clean(_attr(item, "last_event"), 40)
+    if not event:
+        return "last event  none yet"
+    elapsed = _seconds_since(_attr(item, "last_event_at"), now)
+    if elapsed is None:
+        return f"last event  {event}"
+    return f"last event  {event} · {_humanise(elapsed)}"
+
+
+def _card(item: Any, width: int, stream: TextIO, now: datetime) -> list[str]:
+    state = _state_of(item)
+    lines = [_row(_name_of(item), state, width, _bold(stream),
+                  _state_style(state, stream))]
+
+    error = _clean(_attr(item, "error"), 200)
     if error:
-        facts.append(("error", _tidy_error(error, 200), "warning"))
-    event = _event_text(row, now)
-    if event and state in ("running", "failed", "unknown"):
-        facts.append(("last event", event, None))
-
-    return _Summary(
-        name=_name_of(row),
-        state_label=label,
-        state_tone=tone,
-        headline=headline,
-        headline_short=short,
-        sentence=sentence,
-        pending=pending,
-        facts=facts,
-    )
-
-
-# --------------------------------------------------------------------------
-# cards
-
-def _kv(fact: tuple[str, str, str | None]) -> Line:
-    label, value, tone = fact
-    return [("    ", None), (label.ljust(LABEL_PAD), "dim"), (value, tone)]
-
-
-def _pending_cell(count: int) -> Line:
-    return [
-        ("pending", "dim"),
-        ("   ", None),
-        (str(count), "warning" if count else None),
-    ]
-
-
-def _row_with_right(left: Line, right: Line, edge: int) -> list[Line]:
-    if _seg_width(left) + 2 + _seg_width(right) <= edge:
-        gap = edge - _seg_width(left) - _seg_width(right)
-        return [left + [(" " * gap, None)] + right]
-    pad = max(0, edge - _seg_width(right))
-    return [left, [(" " * pad, None)] + right]
-
-
-def _wide_card(summary: _Summary, width: int) -> list[Line]:
-    edge = max(0, width - 2)
-    state_col = max(12, width - 34)
-    name = _ellipsis_middle(summary.name, max(1, state_col - 4))
-    line: Line = [
-        ("  ", None),
-        (name, "bold"),
-        (" " * max(0, state_col - 2 - len(name)), None),
-        (summary.state_label, summary.state_tone),
-    ]
-    if summary.headline:
-        text, tone = summary.headline
-        for candidate in (text, summary.headline_short):
-            if not candidate:
-                continue
-            gap = edge - _seg_width(line) - len(candidate)
-            if gap >= 1:
-                line = line + [(" " * gap, None), (candidate, tone)]
-                break
-
-    lines = [line]
-    if summary.sentence:
-        text, sentence_tone = summary.sentence
-        lines.append([("    ", None), (text, sentence_tone)])
-    facts = list(summary.facts)
-    if summary.pending is not None and facts and facts[0][0] == "last approval":
-        paired = _row_with_right(_kv(facts.pop(0)), _pending_cell(summary.pending), edge)
-        lines.extend(paired)
-    elif summary.pending is not None:
-        lines.append(_kv(("pending", str(summary.pending),
-                          "warning" if summary.pending else None)))
-    lines.extend(_kv(fact) for fact in facts)
-    return lines
-
-
-def _narrow_card(summary: _Summary, width: int) -> list[Line]:
-    edge = max(0, width - 2)
-    name = _ellipsis_middle(summary.name, max(1, edge - 2))
-    lines: list[Line] = [[("  ", None), (name, "bold")]]
-    state_line: Line = [("    ", None),
-                        (summary.state_label, summary.state_tone)]
-    extra: Line | None = None
-    if summary.headline:
-        text, tone = summary.headline
-        joined = state_line + [("  ·  ", "dim"), (text, tone)]
-        if _seg_width(joined) <= edge:
-            state_line = joined
-        else:
-            extra = [("    ", None), (text, tone)]
-    lines.append(state_line)
-    if extra:
-        lines.append(extra)
-    if summary.sentence:
-        text, sentence_tone = summary.sentence
-        lines.append([("    ", None), (text, sentence_tone)])
-    facts = list(summary.facts)
-    pending_fact = ("pending", str(summary.pending),
-                    "warning" if summary.pending else None)
-    if summary.pending is not None and facts and facts[0][0] == "last approval":
-        lines.append(_kv(facts.pop(0)))
-        lines.append(_kv(pending_fact))
-    elif summary.pending is not None:
-        lines.append(_kv(pending_fact))
-    lines.extend(_kv(fact) for fact in facts)
-    return lines
-
-
-# --------------------------------------------------------------------------
-# the push feed
-
-def _feed(rows: list, width: int, now: datetime) -> list[Line]:
-    recent: list[tuple[float, str, str]] = []
-    for row in rows:
-        moment = _parse_time(getattr(row, "last_approval_at", None))
-        if moment is None:
-            continue
-        age = now.timestamp() - moment.timestamp()
-        if age >= DAY:
-            continue
-        recent.append((moment.timestamp(), moment.strftime("%H:%M"), _name_of(row)))
-    recent.sort(key=lambda item: item[0], reverse=True)
-
-    lines: list[Line] = [[("  ", None), ("recent approvals", "bold")]]
-    if not recent:
-        lines.append([("    ", None), ("no approvals in the last 24 hours", "dim")])
+        # A dim note instead of zeros that would be a lie.
+        lines.append(_row(error, "", width, _dim(stream)))
         return lines
-    room = max(4, width - 2 - 4 - 5 - 2 - 2 - len("approved"))
-    for _, clock, name in recent[:FEED_LIMIT]:
-        lines.append([
-            ("    ", None),
-            (clock, "dim"),
-            ("  ", None),
-            (_ellipsis_middle(name, room), None),
-            ("  ", None),
-            ("approved", "dim"),
-        ])
+
+    headline, kind = _approval_line(item, state, now)
+    styles = {"green": _green(stream), "dim": _dim(stream), "plain": None}
+    # The field is a rolling 24 hours, not a calendar day, so say so.
+    counts = (f"{_number(_attr(item, 'approvals_24h'))} in 24h · "
+              f"{_number(_attr(item, 'pending'))} pending")
+    lines.append(_row(headline, counts, width, styles[kind], _dim(stream)))
+    lines.append(_row(_event_line(item, now), "", width, _dim(stream)))
+
+    if state == "failed":
+        lines.append(_row("stopped after an error, see the service log", "",
+                          width, _dim(stream)))
     return lines
 
 
-# --------------------------------------------------------------------------
-# header and frame
+def _safe_card(item: Any, width: int, stream: TextIO,
+               now: datetime) -> list[str]:
+    """A card that cannot take the screen down with it."""
+    try:
+        return _card(item, width, stream, now)
+    except Exception:
+        return [_row("an instance could not be read", "", width,
+                     _dim(stream))]
 
-def _totals_variants(rows: list) -> list[str]:
-    total = len(rows)
-    running = sum(1 for row in rows if _state_of(row) == "running")
-    failed = sum(1 for row in rows if _state_of(row) == "failed")
-    unenrolled = sum(1 for row in rows if _state_of(row) == "no-vault")
-    approvals = sum(_int_of(row, "approvals_24h") for row in rows)
-    noun = "instance" if total == 1 else "instances"
-    head = f"{total} {noun} · {running} running"
-    today = f"{approvals} {'approval' if approvals == 1 else 'approvals'} today"
-    extras = ""
+
+# --- the frame ------------------------------------------------------------
+
+def _summary(items: list[Any]) -> str:
+    if not items:
+        return ""
+    running = sum(1 for item in items if _state_of(item) == "running")
+    failed = sum(1 for item in items if _state_of(item) == "failed")
+    parts = [f"{len(items)} account" + ("" if len(items) == 1 else "s"),
+             f"{running} running" if running else "none running"]
     if failed:
-        extras += f" · {failed} failed"
-    if unenrolled:
-        extras += f" · {unenrolled} not enrolled"
-    return [
-        f"{head}{extras} · {today}",
-        f"{head} · {today}",
-        f"{total} {noun} · {today}",
-    ]
+        parts.append(f"{failed} failed")
+    return " · ".join(parts)
 
 
-def _pick_totals(rows: list, room: int) -> str | None:
-    for text in _totals_variants(rows):
-        if len(text) <= room:
-            return text
-    return None
+def _fit(blocks: list[list[str]], room: int) -> tuple[list[list[str]], int]:
+    """As many cards as fit in ``room`` lines, and how many were dropped."""
+    kept: list[list[str]] = []
+    used = 0
+    for index, block in enumerate(blocks):
+        hidden_after = len(blocks) - index - 1
+        cost = len(block) + 1          # the card and its blank separator
+        tail = 1 if hidden_after else 0  # the "… N more" line
+        if kept and used + cost + tail > room:
+            break
+        used += cost
+        kept.append(block)
+    return kept, len(blocks) - len(kept)
 
 
-def _header(rows: list, width: int, note: str | None) -> list[Line]:
-    edge = max(0, width - 2)
-    word: Line = [("  ", None), ("autoduo", "brand-strong")]
-    if rows:
-        room = edge - _seg_width(word) - 2
-        totals = _pick_totals(rows, room)
-        if totals is not None:
-            gap = edge - _seg_width(word) - len(totals)
-            lines = [word + [(" " * gap, None), (totals, "dim")]]
-        else:
-            totals = _pick_totals(rows, edge - 2) or _totals_variants(rows)[-1]
-            lines = [word, [("  ", None), (totals, "dim")]]
-        lines.append([("  ", None), ("─" * max(0, width - 4), "dim")])
-    else:
-        lines = [word]
-        text = "no instances yet"
-        gap = edge - _seg_width(word) - len(text)
-        if gap >= 1:
-            lines[0] = word + [(" " * gap, None), (text, "dim")]
-        else:
-            lines.append([("  ", None), (text, "dim")])
-    if note:
-        lines.append([("  ", None), (str(note), "warning")])
-    return lines
+def _render(items: list[Any] | None, width: int, stream: TextIO,
+            error: str | None = None, live: bool = False,
+            now: datetime | None = None,
+            height: int | None = None) -> list[str]:
+    """The whole screen as lines, each already within ``width`` columns.
 
-
-def render(rows: Iterable[InstanceStatus], width: int | None = None,
-           stream: TextIO | None = None, now: datetime | None = None,
-           note: str | None = None) -> str:
-    """One complete frame, plain text unless ``stream`` earns colour.
-
-    ``width`` defaults to the terminal, capped at :data:`autoduo.ui.MAX_WIDTH`
-    so the dashboard never stretches past the prose it sits beside.  Every
-    line is laid out inside ``width - 2`` columns: two for the left indent,
-    two for the right margin.
+    ``height`` caps the frame for the alternate screen, which cannot
+    scroll; the plain path passes ``None`` and stays complete.
     """
-    if width is None:
-        width = _terminal_width()
+    now = datetime.now(timezone.utc) if now is None else now
+    width = max(1, width)
+    budget = max(1, width - len(INDENT))
+    lines: list[str] = [""]
+
+    if items is None:
+        lines.append(INDENT + _row("autoduo", "", budget, _green_bold(stream)))
+        lines.append("")
+        note = error or "account states are unavailable"
+        lines.append(INDENT + _row(note, "", budget, _dim(stream)))
+        lines.append("")
+        return [_screen_clip(line, width) for line in lines]
+
+    lines.append(INDENT + _row("autoduo", _summary(items), budget,
+                               _green_bold(stream), _dim(stream)))
+    lines.append(INDENT + ui.dim("─" * budget, stream))
+    lines.append("")
+
+    if not items:
+        lines.append(INDENT + "No accounts are set up yet.")
+        lines.append(INDENT + ui.dim("Run  autoduo setup  to create one.",
+                                     stream))
+        lines.append("")
     else:
-        width = max(1, min(int(width), ui.MAX_WIDTH))
-    rows = list(rows or [])
-    moment = now if now is not None else datetime.now().astimezone()
+        blocks = [_safe_card(item, budget, stream, now) for item in items]
+        hidden = 0
+        if height is not None:
+            room = max(1, height - len(lines) - (1 if live else 0)
+                       - (1 if error else 0))
+            blocks, hidden = _fit(blocks, room)
+        for block in blocks:
+            lines.extend(INDENT + text for text in block)
+            lines.append("")
+        if hidden:
+            lines.append(INDENT + ui.dim(f"… {hidden} more", stream))
 
-    lines = _header(rows, width, note)
-    if not rows:
-        message = "Run autoduo setup to enroll the first instance."
-        if len(message) + 2 > width - 2:
-            message = "Run autoduo setup to enroll one."
-        lines += [
-            [],
-            [("  ", None), ("No instances yet.", "bold")],
-            [("  ", None), (message, "dim")],
-        ]
-        return _join(lines, stream, width)
-
-    lines.append([])
-    for index, row in enumerate(rows):
-        if index:
-            lines.append([])
-        summary = _summarise(row, moment)
-        if width >= WIDE_MIN:
-            lines.extend(_wide_card(summary, width))
-        else:
-            lines.extend(_narrow_card(summary, width))
-    lines.append([])
-    lines.extend(_feed(rows, width, moment))
-    return _join(lines, stream, width)
+    if error:
+        lines.append(INDENT + _row(f"states unavailable · {error}", "",
+                                   budget, _dim(stream)))
+        lines.append("")
+    if live:
+        lines.append(INDENT + ui.dim("q to quit", stream))
+    return [_screen_clip(line, width) for line in lines]
 
 
-# --------------------------------------------------------------------------
-# terminal
+# --- output ---------------------------------------------------------------
 
-def _provider(rows_provider: object) -> Callable[[], Iterable[InstanceStatus]]:
-    """The agreed seam is a callable; a plain list is accepted as a courtesy.
+def _write(out: TextIO, lines: list[str]) -> None:
+    """One static frame. A closed pipe is not worth a traceback."""
+    try:
+        for text in lines:
+            out.write(text + "\n")
+        out.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
 
-    ``cli.py`` may hand over a captured ``status_all()`` result while its own
-    lane catches up; a callable is still asked afresh on every refresh.
+
+def _draw(out: TextIO, lines: list[str]) -> bool:
+    """Redraw in place: home, clear each line, clear what is left below."""
+    try:
+        out.write(_HOME)
+        for text in lines:
+            out.write(_CLEAR_LINE + text + "\n")
+        out.write(_CLEAR_LINE + _CLEAR_BELOW)
+        out.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+    return True
+
+
+def _screen_size(out: TextIO) -> tuple[int, int]:
+    """Columns and lines, from the stream's terminal or the environment.
+
+    A pty can report zero (``script`` and some CI terminals do), and a
+    zero-column frame is a blank frame, so anything unusable falls back to
+    ``COLUMNS``/``LINES`` or 80x24 instead of being taken literally.
     """
-    if callable(rows_provider):
-        return rows_provider
-    rows = list(rows_provider or [])
-    return lambda: rows
+    columns = 0
+    lines = 0
+    try:
+        size = os.get_terminal_size(out.fileno())
+        columns, lines = size.columns, size.lines
+    except Exception:
+        columns = lines = 0
+    if columns <= 0 or lines <= 0:
+        try:
+            fallback = shutil.get_terminal_size(
+                (FALLBACK_COLUMNS, FALLBACK_LINES))
+            columns = columns if columns > 0 else fallback.columns
+            lines = lines if lines > 0 else fallback.lines
+        except Exception:
+            columns = columns or FALLBACK_COLUMNS
+            lines = lines or FALLBACK_LINES
+    try:
+        columns = int(columns)
+    except (TypeError, ValueError):
+        columns = FALLBACK_COLUMNS
+    try:
+        lines = int(lines)
+    except (TypeError, ValueError):
+        lines = FALLBACK_LINES
+    columns = columns if columns > 0 else FALLBACK_COLUMNS
+    lines = lines if lines > 0 else FALLBACK_LINES
+    return max(1, min(columns, MAX_WIDTH)), max(1, min(lines, MAX_LINES))
 
 
-def _interactive(stream: TextIO, once: bool) -> bool:
-    """Live redraw needs a terminal, colour, and ``NO_COLOR`` left unset."""
-    if once:
+def _columns(out: TextIO) -> int:
+    """The line budget: the terminal's width, capped at 80 columns."""
+    return _screen_size(out)[0]
+
+
+def _live(out: TextIO) -> bool:
+    """Live redrawing needs a terminal and permission to colour it.
+
+    ``NO_COLOR`` is taken as a request for plain, copyable output even on a
+    TTY, so that path prints one frame and returns.
+    """
+    if os.environ.get("NO_COLOR"):
         return False
     try:
-        if not stream.isatty():
-            return False
-    except Exception:  # a closed or exotic stream cannot answer
+        return bool(out.isatty())
+    except Exception:
         return False
-    return ui.color_enabled(stream)
 
 
-def _write(stream: TextIO, text: str) -> None:
-    stream.write(text)
-    stream.flush()
-
-
-def _restore(stream: TextIO) -> None:
+def _interval(refresh: Any) -> float:
     try:
-        stream.write(_SHOW_CURSOR + _ALT_OFF)
-        stream.flush()
-    except OSError:  # the terminal is already gone
+        value = float(refresh)
+    except (TypeError, ValueError):
+        return 1.0
+    if value != value:  # NaN
+        return 1.0
+    return min(MAX_INTERVAL, max(0.0, value))
+
+
+def _snapshot(source: Any) -> tuple[list[Any] | None, str | None]:
+    """One frame of data, or ``None`` plus a reason it could not be had."""
+    try:
+        raw = source() if callable(source) else source
+        if raw is None or isinstance(raw, (str, bytes)):
+            return [], None
+        return list(raw), None
+    except Exception as exc:  # a broken status read is a line, not a crash
+        detail = _clean(str(exc), 120) or "no detail"
+        return None, _clean(f"{type(exc).__name__}: {detail}", 160)
+
+
+@contextmanager
+def _keys():
+    """Best-effort cbreak input, so ``q`` acts without Enter.
+
+    Nothing changes when stdin is not a terminal, and the original settings
+    are restored even when Ctrl+C interrupts the read. Setup is kept apart
+    from the ``yield`` so an error in the loop body cannot be mistaken for
+    an error in the terminal (which would make contextlib yield twice).
+    """
+    handle = None
+    saved = None
+    if tty is not None and termios is not None:
+        try:
+            if sys.stdin.isatty():
+                handle = sys.stdin.fileno()
+                saved = termios.tcgetattr(handle)
+        except Exception:
+            handle = saved = None
+    if handle is None or saved is None:
+        yield False
         return
-
-
-def _failure_frame(error: object, stream: TextIO | None) -> str:
-    width = _terminal_width()
-    lines: list[Line] = [
-        [("  ", None), ("autoduo", "brand-strong")],
-        [],
-        [("  ", None), ("Could not read instance status", "warning")],
-        [("    ", None), (_tidy_error(error, max(8, width - 6)), "dim")],
-    ]
-    return _join(lines, stream, width)
-
-
-def run(rows_provider: Callable[[], Iterable[InstanceStatus]],
-        refresh: float = 1.0, stream: TextIO | None = None,
-        once: bool = False) -> int:
-    """Draw the dashboard until Ctrl+C, and restore the terminal either way.
-
-    ``rows_provider`` is called for every frame: it may shell out to
-    ``systemctl`` and it may raise.  The very first failure is fatal (return
-    1, one quiet line, no traceback); a later one keeps the last good rows
-    and says so above them.
-
-    ``once``, a non-terminal stream, or ``NO_COLOR`` renders a single frame
-    and returns 0.  Returns 0 on a normal Ctrl+C as well.
-    """
-    out = sys.stdout if stream is None else stream
-    provider = _provider(rows_provider)
-
     try:
-        rows = list(provider() or [])
-    except KeyboardInterrupt:
-        return 0
-    except Exception as exc:
-        _write(out, _failure_frame(exc, out))
-        return 1
-
-    if not _interactive(out, once):
-        _write(out, render(rows, stream=out))
-        return 0
-
-    delay = max(0.0, float(refresh))
-    entered = False
+        tty.setcbreak(handle)
+    except Exception:
+        yield False
+        return
     try:
-        _write(out, _ALT_ON + _HIDE_CURSOR)
-        entered = True
-        _write(out, _HOME + render(rows, stream=out) + _CLEAR_BELOW)
-        while True:
-            if delay:
-                time.sleep(delay)
-            note = None
-            try:
-                rows = list(provider() or [])
-            except Exception as exc:
-                note = "status check failed · " + _tidy_error(exc, 120)
-            _write(out, _HOME + render(rows, stream=out, note=note) + _CLEAR_BELOW)
+        yield True
+    finally:
+        try:
+            termios.tcsetattr(handle, termios.TCSADRAIN, saved)
+        except Exception:
+            pass
+
+
+def _pause(timeout: float) -> bool:
+    try:
+        time.sleep(max(0.0, timeout))
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _quit(timeout: float) -> bool:
+    """Wait up to ``timeout`` for a key; ``True`` means stop the loop."""
+    try:
+        handle = sys.stdin.fileno()
+    except Exception:
+        return _pause(timeout)
+    try:
+        ready, _, _ = select.select([handle], [], [], max(0.0, timeout))
+    except Exception:
+        return _pause(timeout)
+    if not ready:
+        return False
+    try:
+        key = sys.stdin.read(1)
+    except Exception:
+        return False
+    return key in ("q", "Q") or key == ""  # EOF must not spin the loop
+
+
+def _live_loop(statuses: Any, interval: float, columns: int,
+               out: TextIO) -> int:
+    items: list[Any] | None = None
+    error: str | None = None
+    try:
+        out.write(_ENTER)
+        out.flush()
+        with _keys():
+            while True:
+                fresh, failure = _snapshot(statuses)
+                if failure is None:
+                    items, error = fresh, None
+                else:
+                    error = failure  # keep the last good frame's data
+                columns, height = _screen_size(out)
+                frame = _render(items, columns, out, error=error, live=True,
+                                height=height)
+                if not _draw(out, frame):
+                    break
+                if _quit(interval):
+                    break
     except KeyboardInterrupt:
-        return 0
-    except BrokenPipeError:
         return 0
     finally:
-        if entered:
-            _restore(out)
+        try:
+            out.write(_LEAVE)
+            out.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+    return 0
+
+
+def run(statuses: Any, refresh: float = 1.0,
+        stream: TextIO | None = None) -> int:
+    """Show the dashboard until the operator quits. Returns 0.
+
+    ``statuses`` is a list of instance statuses or a callable returning one;
+    a callable is asked once per frame, so systemd is queried once per
+    refresh rather than once per card. ``refresh`` is the redraw interval in
+    seconds. ``stream`` defaults to stdout, and is what a test passes in.
+    """
+    out = sys.stdout if stream is None else stream
+    columns = _columns(out)
+    if not _live(out):
+        items, error = _snapshot(statuses)
+        _write(out, _render(items, columns, out, error=error))
+        return 0
+    return _live_loop(statuses, _interval(refresh), columns, out)
