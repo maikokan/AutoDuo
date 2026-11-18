@@ -109,9 +109,10 @@ def seal(
     The file-level schema version is taken from `payload["v"]` so future
     versions can self-describe.
 
-    Sets parent dir to 0700 and file to 0600 regardless of caller umask.
-    Atomic via write-to-tmp + rename so a crash mid-write can't corrupt
-    an existing vault.
+    Creates the parent directory 0700 only when it did not already exist;
+    an existing parent's mode is left alone. The file is 0600 regardless of
+    caller umask. Atomic via write-to-tmp + rename so a crash mid-write
+    can't corrupt an existing vault.
     """
     p = pathlib.Path(path)
     parent = p.parent

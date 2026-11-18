@@ -283,15 +283,16 @@ class DuoBotDaemon:
                 severity="high",
             )
 
-    def _record_success(self) -> None:
-        """Clear failure state after a cycle that had no auth error.
+    def _clear_auth_failures(self) -> None:
+        """Clear the auth window after a cycle that saw no auth error.
 
-        The auth window is *not* cleared by a merely successful poll: an
-        approval in the same or previous cycle can fail with AuthError and
-        the next poll must not erase it (ROBUSTNESS 3.1). Callers pass
-        `had_auth_error` through; this method is only called when false.
+        Deliberately separate from network-backoff reset: an approval-path
+        auth error must not pin the network backoff (or vice versa).
         """
         self._auth_failures.clear()
+
+    def _reset_network_state(self) -> None:
+        """Clear transient/network backoff after a successful poll."""
         self._consecutive_network_errors = 0
         self._backoff_seconds = DEFAULT_BACKOFF_BASE_SECONDS
 
@@ -412,10 +413,9 @@ class DuoBotDaemon:
             self._note_poll_error("poll_unexpected_error", error=repr(e))
             return
 
-        # A successful poll clears transient/network backoff, but auth
-        # failures are only cleared at the end of a cycle with none.
-        self._consecutive_network_errors = 0
-        self._backoff_seconds = DEFAULT_BACKOFF_BASE_SECONDS
+        # A successful poll always resets transient/network backoff, but
+        # auth failures are only cleared at the end of a cycle with none.
+        self._reset_network_state()
 
         if txs:
             for tx in txs:
@@ -426,7 +426,7 @@ class DuoBotDaemon:
             self._maybe_heartbeat()
 
         if not had_auth_error:
-            self._record_success()
+            self._clear_auth_failures()
 
     def _approve_transaction(self, tx: dict[str, Any]) -> bool:
         """Handle one transaction. Returns True if it caused an auth error."""

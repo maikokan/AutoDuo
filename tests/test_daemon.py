@@ -494,11 +494,65 @@ def test_second_instance_exits_5(tmp_path, monkeypatch):
         monkeypatch.setattr(
             "autoduo.daemon.DuoBotDaemon.run", lambda self: 0
         )
+        monkeypatch.setattr(
+            daemon, "INSTANCE_LOCK_TIMEOUT_SECONDS", 0.2
+        )
         rc = daemon.main(argv=["--vault", str(vpath), "--no-passphrase"])
     finally:
         import os
         os.close(fd)
     assert rc == daemon.EXIT_ALREADY_RUNNING == 5
+
+
+def test_network_backoff_not_pinned_by_approval_auth_error(
+    fake_clock, fake_sleep, log_capture
+):
+    """An approval auth error must not leave network backoff at the cap."""
+    from autoduo.client import AuthError, NetworkError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    polls = {"n": 0}
+
+    class Mixed(FakeDeviceClient):
+        def list_transactions(self):
+            polls["n"] += 1
+            if polls["n"] == 1:
+                raise NetworkError("blip")
+            return [{"urgid": "u1"}]
+
+        def approve(self, urgid):
+            raise AuthError("401")
+
+    d = _make_daemon(Mixed(), clock, sleep_fn, log_capture, max_auth_failures=10)
+    d._run_once()  # network error -> backoff 2
+    assert d._backoff_seconds == 2.0
+    d._run_once()  # poll OK resets network; approval auth-fails
+    assert d._backoff_seconds == 1.0
+    assert d._consecutive_network_errors == 0
+    assert len(d._auth_failures) == 1
+
+
+def test_independent_vaults_have_independent_locks(tmp_path, monkeypatch):
+    import os
+    from autoduo import vault
+
+    va = tmp_path / "a" / "vault.enc"
+    vb = tmp_path / "b" / "vault.enc"
+    payload = {
+        "v": 1, "akey": "A", "pkey": "P",
+        "host": "api-x.duosecurity.com", "private_key_pem": "ignored",
+    }
+    vault.seal(va, None, payload)
+    vault.seal(vb, None, payload)
+
+    fd_b = daemon._acquire_instance_lock(vb)
+    try:
+        monkeypatch.setattr("autoduo.daemon.DeviceClient", FakeDeviceClient)
+        monkeypatch.setattr("autoduo.daemon.DuoBotDaemon.run", lambda self: 0)
+        rc = daemon.main(argv=["--vault", str(va), "--no-passphrase"])
+    finally:
+        os.close(fd_b)
+    assert rc == 0
 
 
 def test_world_readable_passphrase_file_rejected(tmp_path, monkeypatch):
@@ -739,3 +793,71 @@ def test_state_save_preserves_shared_dir_mode(
     assert stat_mod.S_IMODE(shared.stat().st_mode) == 0o755
     assert stat_mod.S_IMODE(state_path.stat().st_mode) == 0o600
     assert json.loads(state_path.read_text())["u1"]
+
+
+def test_network_backoff_not_pinned_by_approval_auth_error(
+    fake_clock, fake_sleep, log_capture
+):
+    """A network blip plus an approval AuthError must not leave backoff at
+    its cap: network and auth state are reset independently."""
+    from autoduo.client import AuthError, NetworkError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+
+    class Mixed(FakeDeviceClient):
+        mode = "net"
+
+        def list_transactions(self):
+            if self.mode == "net":
+                raise NetworkError("blip")
+            return list(self._transactions)
+
+        def approve(self, urgid):
+            self.approved.append(urgid)
+            raise AuthError("401")
+
+    client = Mixed(transactions_per_poll=[{"urgid": "u1"}])
+    d = _make_daemon(client, clock, sleep_fn, log_capture, max_auth_failures=10)
+
+    d._run_once()  # network error -> backoff 2
+    assert d._backoff_seconds == 2.0
+
+    client.mode = "ok"
+    d._run_once()  # successful poll resets network, approval auth-fails
+    assert d._backoff_seconds == 1.0
+    assert len(d._auth_failures) == 1
+
+    client.mode = "net"
+    d._run_once()  # next blip backs off from base, not from the cap
+    assert d._backoff_seconds == 2.0
+
+
+def test_independent_vaults_have_independent_locks(tmp_path, monkeypatch):
+    """Multiple accounts are independent instances: a held lock for vault B
+    must not block instance A (lock path is derived from --vault)."""
+    from autoduo import vault
+
+    vault_a = tmp_path / "account-a" / "vault.enc"
+    vault_b = tmp_path / "account-b" / "vault.enc"
+    payload = {
+        "v": 1, "akey": "A", "pkey": "P", "host": "h",
+        "private_key_pem": "unused",
+    }
+    vault.seal(vault_a, None, payload)
+    vault.seal(vault_b, None, payload)
+
+    lock_a = vault_a.with_name(vault_a.name + ".lock")
+    lock_b = vault_b.with_name(vault_b.name + ".lock")
+    assert lock_a != lock_b
+
+    fd_b = daemon._acquire_instance_lock(vault_b)
+    try:
+        monkeypatch.setattr(
+            "autoduo.daemon.DeviceClient", FakeDeviceClient
+        )
+        monkeypatch.setattr("autoduo.daemon.DuoBotDaemon.run", lambda self: 0)
+        rc = daemon.main(argv=["--vault", str(vault_a), "--no-passphrase"])
+    finally:
+        import os
+        os.close(fd_b)
+    assert rc == 0
