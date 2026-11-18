@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The vault was world-readable between `rename` and `chmod`, and was not
   fsynced; both fixed, and the parent directory is only tightened when this
   program created it.
+- A `seen.json` written by an older build kept its group- or world-readable
+  mode until the next approval, which on a quiet account can be days. It is
+  tightened to 0600 when it is loaded.
 - The activation URL was written to a predictable `/tmp` path before being
   chmodded; it now uses `mkstemp` and is removed in a `finally`.
 - `autoduo install` copied the package directory to `/usr/local/bin/autoduo`
