@@ -10,11 +10,16 @@ Colour rules, in order:
   3. TERM=dumb                           -> no colour.
   4. otherwise                           -> colour only on a TTY.
 
-The palette is deliberately quiet: one warm clay accent for the thing
-that matters, soft green for success, muted amber for a warning and
-muted red for an error. Everything else is the terminal's own ink, with
-dim for metadata and bold for emphasis. Prose wraps at 68 columns, so
-the result fits an 80-column terminal with room to spare.
+The palette is deliberately quiet: one confident but unbright green for
+the thing that matters, soft green for success, muted amber for a warning
+and muted red for an error. Everything else is the terminal's own ink,
+with dim for metadata and bold for emphasis. Prose wraps at 68 columns,
+so the result fits an 80-column terminal with room to spare.
+
+The accent is Duo's green, borrowed rather than copied: it marks the one
+thing on a screen worth looking at, and it means "approved" wherever it
+appears. The dashboard in :mod:`autoduo.dashboard` names the same four
+roles through :func:`paint`, so there is exactly one palette in the code.
 """
 from __future__ import annotations
 
@@ -32,11 +37,22 @@ _DIM = "2"
 
 # name: (256-colour foreground, nearest basic colour)
 _COLOURS = {
-    "accent": ("38;5;173", "33"),   # warm clay
+    "accent": ("38;5;77", "32"),    # Duo green, deliberately not bright
     "success": ("38;5;108", "32"),  # soft green
     "warning": ("38;5;179", "33"),  # muted amber
     "danger": ("38;5;174", "31"),   # muted red
 }
+
+# Duo's own palette is green on near-black. A terminal colours the ink, not
+# the background, so that becomes one green accent in three strengths: the
+# real 256-colour green, a slightly deeper green for colour terminals that
+# do not advertise 256, and plain green for the classic eight-colour ones.
+_DUO_GREENS = ("38;5;77", "38;5;71", "32")
+
+# Terms that are known to be colour but not known to carry 256.
+_MID_COLOUR_TERMS = frozenset({
+    "screen", "screen-bce", "tmux", "xterm-color", "rxvt", "rxvt-unicode",
+})
 
 
 def color_enabled(stream: TextIO | None = None, env=None) -> bool:
@@ -77,8 +93,51 @@ def bold(text: str, stream: TextIO | None = None) -> str:
 
 
 def accent(text: str, stream: TextIO | None = None) -> str:
-    """The one warm mark on a screen. Use it once."""
+    """The one green mark on a screen. Use it once."""
     return _paint(text, _colour_code("accent"), stream)
+
+
+def paint(text: str, name: str, bold: bool = False,
+          stream: TextIO | None = None) -> str:
+    """Colour one word by palette name: accent, success, warning, danger.
+
+    For inline use by screens that build their own lines (the dashboard).
+    An unknown name is a caller's mistake, not a reason to break a
+    terminal, so it degrades to plain ink rather than raising.
+    """
+    if name not in _COLOURS:
+        return text
+    code = _colour_code(name)
+    return _paint(text, f"{code};{_BOLD}" if bold else code, stream)
+
+
+def duo_green_code(env=None) -> str:
+    """The green to use for the given terminal, 256-colour first.
+
+    ``COLORTERM`` or a term name carrying ``256`` is taken at its word and
+    gets 77; a few well-known colour terms that predate 256 get 71; anything
+    else gets plain green, which every colour terminal understands.
+    """
+    env = os.environ if env is None else env
+    term = (env.get("TERM") or "").lower()
+    if env.get("COLORTERM") or "256" in term or "truecolor" in term:
+        return _DUO_GREENS[0]
+    if term in _MID_COLOUR_TERMS:
+        return _DUO_GREENS[1]
+    return _DUO_GREENS[2]
+
+
+def duo_green(text: str, stream: TextIO | None = None,
+              strong: bool = False) -> str:
+    """The single accent: Duo's green, for a live instance and a fresh push.
+
+    Colour is off in a pipe, under ``NO_COLOR`` or on a dumb terminal, so the
+    text alone always has to carry the meaning.
+    """
+    code = duo_green_code()
+    if strong:
+        code = f"{code};{_BOLD}"
+    return _paint(text, code, stream)
 
 
 def _out(stream: TextIO | None) -> TextIO:
@@ -195,3 +254,48 @@ def rule(width: int = RULE_WIDTH, stream: TextIO | None = None) -> None:
     """One hairline, when a screen genuinely needs a break. At most one."""
     out = _out(stream)
     print(dim("─" * width, out), file=out)
+
+
+# --- instance state vocabulary --------------------------------------------
+#
+# One vocabulary for the dashboard's cards (and any future `autoduo status`
+# line): the words first, the tone second. A caller that lays a line out
+# before painting it needs the plain label, so the mapping is kept apart
+# from the painting.
+
+_STATES = {
+    "running": ("running", "brand"),
+    "stopped": ("stopped", "dim"),
+    "failed": ("failed", "danger"),
+    "unknown": ("unknown", "warning"),
+    "no-vault": ("not enrolled", "warning"),
+}
+
+
+def state_style(state: str) -> tuple[str, str]:
+    """``(label, tone)`` for one instance state.
+
+    An unfamiliar state is shown as given, dimmed -- never guessed at. The
+    tones are the names :func:`paint` knows, plus ``brand`` (Duo green) and
+    ``dim``, so a caller never has to nest one escape inside another.
+    """
+    raw = "" if state is None else str(state).strip()
+    known = _STATES.get(raw.lower())
+    if known:
+        return known
+    return (raw or "unknown", "dim")
+
+
+def state_label(state: str) -> str:
+    """The words a person reads: ``no-vault`` is "not enrolled"."""
+    return state_style(state)[0]
+
+
+def state_word(state: str, stream: TextIO | None = None) -> str:
+    """The state word, painted in the quiet status vocabulary."""
+    label, name = state_style(state)
+    if name == "brand":
+        return duo_green(label, stream)
+    if name == "dim":
+        return dim(label, stream)
+    return paint(label, name, stream)

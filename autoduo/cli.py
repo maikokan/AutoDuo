@@ -7,14 +7,20 @@ text, no escape sequences).
 Usage:
     autoduo setup      — interactive: disclaimer, paste link, enroll, start
     autoduo install    — install systemd service (no disclaimer)
-    autoduo uninstall  — remove everything
-    autoduo start      — start the daemon
-    autoduo stop       — stop the daemon
-    autoduo restart    — restart the daemon
-    autoduo status     — show daemon status
-    autoduo logs       — tail daemon logs
+    autoduo uninstall  — remove one instance (or --all)
+    autoduo start      — start the instance's daemon
+    autoduo stop       — stop the instance's daemon
+    autoduo restart    — restart the instance's daemon
+    autoduo status     — show the instance's daemon status
+    autoduo logs       — tail the instance's daemon log
+    autoduo instances  — list every instance and its state
+    autoduo watch      — live dashboard (needs autoduo/dashboard.py)
     autoduo version    — print version
     autoduo enroll     — one-shot enroll (no daemon start)
+
+Every command accepts ``--instance NAME`` before or after the command
+name. The default instance is ``default``, which keeps the pre-instance
+paths so an existing install needs no migration.
 """
 from __future__ import annotations
 
@@ -25,14 +31,20 @@ import subprocess
 import sys
 import tempfile
 
-from autoduo import ui
+from autoduo import instances, ui
 
 REPO_DIR = pathlib.Path(__file__).resolve().parent.parent
-VAULT_DIR = pathlib.Path("/var/lib/autoduo")
-LOG_DIR = pathlib.Path("/var/log/autoduo")
-VAULT_PATH = VAULT_DIR / "vault.enc"
 UNIT_PATH = pathlib.Path("/etc/systemd/system/autoduo.service")
+UNIT_TEMPLATE_PATH = pathlib.Path("/etc/systemd/system/autoduo@.service")
 MAX_RETRIES = 3
+
+# Set by main() from --instance; commands keep their zero-argument shape
+# so setup() can call start() and the dispatch table stays simple.
+_ACTIVE_INSTANCE = instances.resolve(instances.DEFAULT_NAME)
+# True only when --instance was typed: `watch` then narrows to that one
+# account instead of showing every instance.
+_INSTANCE_EXPLICIT = False
+_OPTS: dict[str, bool] = {}
 
 DUO_ADMIN_HINT = "Duo Admin → Users → Add Device → Tablet → Android"
 
@@ -64,12 +76,23 @@ def _secret_tempfile(suffix: str = ".txt") -> pathlib.Path:
     return pathlib.Path(name)
 
 
+def _paths() -> instances.InstancePaths:
+    """Paths of the instance selected by ``--instance``."""
+    return _ACTIVE_INSTANCE
+
+
+def _unit() -> str:
+    return instances.unit_name(_paths())
+
+
+def _instance_flag() -> str:
+    """The ``--instance`` suffix a printed command needs, if any."""
+    paths = _paths()
+    return "" if paths.legacy else f" --instance {paths.name}"
+
+
 def _service_active() -> bool:
-    r = subprocess.run(
-        ["systemctl", "is-active", "autoduo"],
-        capture_output=True, text=True,
-    )
-    return r.stdout.strip() == "active"
+    return instances.unit_state(_paths()) == "running"
 
 
 def _read(prompt: str) -> str:
@@ -208,9 +231,13 @@ def _confirm(prompt: str) -> bool:
 def cmd_setup():
     """Interactive setup: paste activation link, enroll, start."""
     _ensure_root()
+    paths = _paths()
 
     if not _show_disclaimer_and_get_acceptance():
         return 1
+
+    if not paths.legacy:
+        ui.kv("instance", paths.name)
 
     if not (REPO_DIR / ".venv").exists():
         ui.line()
@@ -231,9 +258,9 @@ def cmd_setup():
     act_file = _secret_tempfile()
     act_file.write_text(url)
 
-    if VAULT_PATH.exists():
+    if paths.vault.exists():
         ui.line()
-        ui.kv("vault", str(VAULT_PATH))
+        ui.kv("vault", str(paths.vault))
         if not _confirm("  Re-enroll and orphan the existing device? (y/N) "):
             act_file.unlink(missing_ok=True)
             ui.note("Skipping enrollment. The vault is unchanged.")
@@ -242,9 +269,12 @@ def cmd_setup():
 
     ui.line()
     ui.step(2, "Enroll this device", "Generating an RSA keypair and calling Duo.")
+    # The instance *is* the vault path here: enroll writes exactly one
+    # file, so passing the resolved path keeps it in the right instance.
+    instances.ensure_dirs(paths)
     rc = subprocess.run(
         [_venv_python(), "-m", "autoduo.enroll",
-         "--vault", str(VAULT_PATH),
+         "--vault", str(paths.vault),
          "--activation-file", str(act_file),
          "--no-passphrase"],
         cwd=str(REPO_DIR),
@@ -263,7 +293,10 @@ def cmd_setup():
             "Duo Mobile asks once, now. Tap Approve. This is the only "
             "time you need to touch it.")
     if not _confirm("  Did you approve it on your phone? (y/N) "):
-        ui.note("Approve on your phone, then run: autoduo start")
+        ui.note(
+            "Approve on your phone, then run: "
+            f"autoduo start{_instance_flag()}"
+        )
         return 1
 
     ui.line()
@@ -311,9 +344,16 @@ def _push_test_gate() -> int:
     for name, desc in (
         ("autoduo status", "is the daemon running"),
         ("autoduo logs", "live log tail"),
-        ("autoduo uninstall", "remove everything"),
+        ("autoduo instances", "every account and its state"),
+        ("autoduo uninstall", "remove this instance"),
     ):
         ui.line(f"    {ui.bold(f'{name:<18}')}  {desc}")
+    if not _paths().legacy:
+        ui.line()
+        ui.note(
+            f"These apply to instance {_paths().name}; add "
+            f"--instance {_paths().name} to each."
+        )
     ui.line()
     return 0
 
@@ -329,8 +369,7 @@ def _install():
     _run(["systemctl", "enable", "--now", "systemd-timesyncd"], check=False)
 
     ui.heading("Creating directories")
-    VAULT_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    instances.ensure_dirs(_paths())
 
     ui.heading("Creating the Python environment")
     if not (REPO_DIR / ".venv").exists():
@@ -341,6 +380,10 @@ def _install():
 
     ui.heading("Installing the systemd unit")
     shutil.copy2(REPO_DIR / "systemd" / "autoduo.service", UNIT_PATH)
+    # The template makes every named instance a unit of its own.
+    template = REPO_DIR / "systemd" / "autoduo@.service"
+    if template.exists():
+        shutil.copy2(template, UNIT_TEMPLATE_PATH)
     _run(["systemctl", "daemon-reload"])
 
     ui.heading("Installing the autoduo command")
@@ -363,20 +406,57 @@ def cmd_install():
     ui.note("Next: sudo autoduo setup")
 
 
-def cmd_uninstall():
-    """Remove everything."""
-    _ensure_root()
-    ui.banner("autoduo uninstall")
+def _rmdir_if_empty(path: pathlib.Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass  # absent, or another instance still lives there
 
-    if subprocess.run(["systemctl", "list-unit-files", "autoduo"],
-                      capture_output=True, returncode=0).returncode == 0:
-        ui.heading("Stopping the service")
-        subprocess.run(["systemctl", "disable", "--now", "autoduo"],
-                       capture_output=True, check=False)
 
-    ui.heading("Removing the systemd unit")
+def _remove_instance_files(paths: instances.InstancePaths) -> None:
+    """Delete one instance's vault, state, lock and logs — and nothing else.
+
+    The legacy instance shares ``/var/lib/autoduo`` with the
+    ``instances/`` container, so it is removed file by file and the
+    directories are kept while any other instance still needs them.
+    """
+    if paths.legacy:
+        for target in (
+            paths.vault,
+            paths.actual_lock,
+            paths.state,
+            paths.lock,
+        ):
+            target.unlink(missing_ok=True)
+        _rmdir_if_empty(paths.vault.parent)
+        for target in (paths.daemon_log, paths.audit_log):
+            target.unlink(missing_ok=True)
+        _rmdir_if_empty(paths.daemon_log.parent)
+        return
+    shutil.rmtree(paths.vault.parent, ignore_errors=True)
+    shutil.rmtree(paths.daemon_log.parent, ignore_errors=True)
+
+
+def _uninstall_all() -> int:
+    """Remove every instance, both units and the global install files."""
+    typed = _read(
+        "  This removes every instance. Type ALL to continue: "
+    ).strip()
+    if typed != "ALL":
+        ui.error("Confirmation did not match. Nothing was changed.")
+        return 1
+
+    ui.heading("Stopping every instance")
+    for paths in instances.list_instances():
+        subprocess.run(
+            ["systemctl", "disable", "--now", instances.unit_name(paths)],
+            capture_output=True, check=False,
+        )
+
+    ui.heading("Removing the systemd units")
     UNIT_PATH.unlink(missing_ok=True)
-    _run(["systemctl", "daemon-reload"])
+    UNIT_TEMPLATE_PATH.unlink(missing_ok=True)
+    _run(["systemctl", "daemon-reload"], check=False)
 
     ui.heading("Removing log rotation")
     pathlib.Path("/etc/logrotate.d/autoduo").unlink(missing_ok=True)
@@ -385,38 +465,94 @@ def cmd_uninstall():
     pathlib.Path("/usr/local/bin/autoduo").unlink(missing_ok=True)
 
     ui.heading("Removing data and logs")
-    shutil.rmtree("/var/lib/autoduo", ignore_errors=True)
-    shutil.rmtree("/var/log/autoduo", ignore_errors=True)
+    shutil.rmtree(instances.DATA_ROOT, ignore_errors=True)
+    shutil.rmtree(instances.LOG_ROOT, ignore_errors=True)
 
     ui.line()
     ui.ok("Uninstall complete.")
-    ui.note("The source tree at /opt/autoduo is left in place.")
+    ui.note("The source tree is left in place.")
+    return 0
+
+
+def cmd_uninstall():
+    """Remove one instance, or all of them with --all."""
+    _ensure_root()
+    ui.banner("autoduo uninstall")
+
+    if _OPTS.get("all"):
+        return _uninstall_all()
+
+    paths = _paths()
+
+    # A named instance needs its own name typed: a stray Enter must not
+    # erase a Duo account. The default instance keeps the historical
+    # no-prompt behaviour for scripted removal.
+    if not paths.legacy:
+        typed = _read(f"  Type {paths.name} to remove this instance: ").strip()
+        if typed != paths.name:
+            ui.error("Instance name did not match. Nothing was changed.")
+            return 1
+
+    ui.heading("Stopping the service")
+    subprocess.run(
+        ["systemctl", "disable", "--now", _unit()],
+        capture_output=True, check=False,
+    )
+
+    if paths.legacy:
+        ui.heading("Removing the systemd unit")
+        UNIT_PATH.unlink(missing_ok=True)
+        _run(["systemctl", "daemon-reload"], check=False)
+
+    ui.heading("Removing data and logs")
+    _remove_instance_files(paths)
+
+    ui.line()
+    ui.ok(f"Instance {paths.name} removed.")
+    ui.note(
+        "Global files (the command, logrotate and the unit template) are "
+        "kept; autoduo uninstall --all removes them."
+    )
+    return 0
 
 
 def cmd_start():
     _ensure_root()
-    _run(["systemctl", "start", "autoduo"])
-    ui.ok("Daemon started.")
+    _run(["systemctl", "start", _unit()])
+    ui.ok(f"Instance {_paths().name} started.")
 
 
 def cmd_stop():
     _ensure_root()
-    _run(["systemctl", "stop", "autoduo"])
-    ui.ok("Daemon stopped.")
+    _run(["systemctl", "stop", _unit()])
+    ui.ok(f"Instance {_paths().name} stopped.")
 
 
 def cmd_restart():
     _ensure_root()
-    _run(["systemctl", "restart", "autoduo"])
-    ui.ok("Daemon restarted.")
+    _run(["systemctl", "restart", _unit()])
+    ui.ok(f"Instance {_paths().name} restarted.")
 
 
 def cmd_status():
+    paths = _paths()
     ui.line()
-    _run(["systemctl", "status", "autoduo", "--no-pager"], check=False)
+    ui.kv("instance", paths.name)
+    ui.kv("vault", str(paths.vault))
+    # A missing vault is not "a stopped service": nothing was ever enrolled,
+    # and reporting success for it is the same false-green this codebase
+    # keeps having to remove.
+    if not paths.vault.exists():
+        ui.line()
+        ui.warn(
+            f"Instance {paths.name} is not enrolled. "
+            f"Run: autoduo setup --instance {paths.name}"
+        )
+        return 1
+    _run(["systemctl", "status", _unit(), "--no-pager"], check=False)
     if _service_active():
         r = subprocess.run(
-            ["journalctl", "-u", "autoduo", "-n", "5", "--no-pager"],
+            ["journalctl", "-u", _unit(), "-n", "5", "--no-pager"],
             capture_output=True, text=True,
         )
         if r.stdout.strip():
@@ -428,35 +564,36 @@ def cmd_status():
 
 def cmd_logs():
     _ensure_root()
-    ui.note("Tailing the journal. Ctrl+C stops it.")
+    ui.note(f"Tailing {_unit()} in the journal. Ctrl+C stops it.")
     ui.line()
     try:
-        subprocess.run(["journalctl", "-u", "autoduo", "-f"])
+        subprocess.run(["journalctl", "-u", _unit(), "-f"])
     except KeyboardInterrupt:
         ui.line()
         ui.note("Stopped.")
 
 
 def cmd_version():
-    """Print autoduo version."""
+    """Print autoduo version and the selected instance."""
     from autoduo import __version__
     ui.line(f"autoduo {__version__}")
-    # If systemd unit exists, show whether daemon is active
-    if UNIT_PATH.exists():
-        r = subprocess.run(
-            ["systemctl", "is-active", "autoduo"],
-            capture_output=True, text=True,
-        )
-        status = r.stdout.strip()
-        ui.kv("daemon", status or "not running", indent=0)
+    paths = _paths()
+    ui.kv("instance", paths.name, indent=0)
+    # If the unit exists, show whether its daemon is active.
+    if UNIT_PATH.exists() or UNIT_TEMPLATE_PATH.exists():
+        ui.kv("daemon", instances.unit_state(paths), indent=0)
 
 
 def cmd_enroll():
     """One-shot enroll (no daemon start)."""
     _ensure_root()
+    paths = _paths()
 
     if not _show_disclaimer_and_get_acceptance():
         return 1
+
+    if not paths.legacy:
+        ui.kv("instance", paths.name)
 
     ui.step(1, "Paste your activation URL", DUO_ADMIN_HINT)
     url = _prompt_with_retry("  Activation URL: ", validator=_validate_url)
@@ -469,9 +606,10 @@ def cmd_enroll():
     act_file = _secret_tempfile()
     act_file.write_text(url)
 
+    instances.ensure_dirs(paths)
     rc = subprocess.run(
         [_venv_python(), "-m", "autoduo.enroll",
-         "--vault", str(VAULT_PATH),
+         "--vault", str(paths.vault),
          "--activation-file", str(act_file),
          "--no-passphrase"],
         cwd=str(REPO_DIR),
@@ -481,9 +619,81 @@ def cmd_enroll():
     if rc.returncode == 0:
         ui.line()
         ui.ok("Enrollment complete.")
-        ui.note("Approve the new-device prompt on your phone, then run: autoduo start")
+        ui.note(
+            "Approve the new-device prompt on your phone, then run: "
+            f"autoduo start{_instance_flag()}"
+        )
         return 0
     return rc.returncode
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Instance listing and dashboard dispatch
+# ──────────────────────────────────────────────────────────────────────
+
+def _short_time(value: str | None) -> str:
+    """``2026-11-18T02:08:09+00:00`` → ``2026-11-18 02:08`` (or never)."""
+    if not value:
+        return "never"
+    return value.replace("T", " ")[:16]
+
+
+def _print_instance_table(rows: list[instances.InstanceStatus]) -> None:
+    """One compact, plainly aligned line per instance, inside 80 columns."""
+    name_width = max(4, min(32, max(len(row.paths.name) for row in rows)))
+    ui.line(ui.bold(
+        f"  {'NAME'.ljust(name_width)}  {'STATE':<9}  "
+        f"{'LAST APPROVAL':<16}  {'24H':>3}  {'PEND':>4}"
+    ))
+    for row in rows:
+        ui.line(
+            f"  {row.paths.name.ljust(name_width)}  {row.state:<9}  "
+            f"{_short_time(row.last_approval_at):<16}  "
+            f"{row.approvals_24h:>3}  {row.pending:>4}"
+        )
+
+
+def cmd_instances():
+    """List every instance with state and recent activity."""
+    rows = instances.status_all()
+    ui.line()
+    _print_instance_table(rows)
+    ui.line()
+
+    needs_setup = [row.paths.name for row in rows if row.state == "no-vault"]
+    if needs_setup:
+        ui.note(
+            "No vault yet: " + ", ".join(needs_setup)
+            + " — run autoduo setup for that instance."
+        )
+    for row in rows:
+        if row.error:
+            ui.note(f"{row.paths.name}: {row.error}")
+    return 0
+
+
+def cmd_watch():
+    """Live dashboard, refreshed from the instance status module.
+
+    The dashboard takes a *callable* so it re-polls every frame; a
+    snapshot list would freeze the view. ``--instance NAME`` narrows it
+    to one account, otherwise every instance is shown.
+    """
+    try:
+        from autoduo import dashboard
+    except ImportError:
+        ui.error(
+            "watch needs the dashboard module (autoduo/dashboard.py), "
+            "which is not installed in this build."
+        )
+        return 1
+
+    names = [_paths().name] if _INSTANCE_EXPLICIT else None
+
+    def statuses() -> list[instances.InstanceStatus]:
+        return instances.status_all(names)
+
+    return dashboard.run(statuses, refresh=1.0) or 0
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -499,6 +709,8 @@ COMMANDS = {
     "restart": cmd_restart,
     "status": cmd_status,
     "logs": cmd_logs,
+    "instances": cmd_instances,
+    "watch": cmd_watch,
     "version": cmd_version,
     "enroll": cmd_enroll,
 }
@@ -506,35 +718,82 @@ COMMANDS = {
 COMMAND_HELP = (
     ("setup", "interactive setup with disclaimer (first run)"),
     ("install", "install the service and its dependencies"),
-    ("uninstall", "remove the service and its data"),
+    ("uninstall", "remove one instance (--all for everything)"),
     ("enroll", "enroll with a Duo activation URL"),
-    ("start", "start the daemon"),
-    ("stop", "stop the daemon"),
-    ("restart", "restart the daemon"),
-    ("status", "show the daemon status"),
-    ("logs", "tail the daemon log"),
+    ("start", "start the instance's daemon"),
+    ("stop", "stop the instance's daemon"),
+    ("restart", "restart the instance's daemon"),
+    ("status", "show the instance's daemon status"),
+    ("logs", "tail the instance's daemon log"),
+    ("instances", "list every instance and its state"),
+    ("watch", "live dashboard of all instances"),
     ("version", "print the version"),
 )
 
 
+def _split_instance(argv: list[str]) -> tuple[list[str], str | None]:
+    """Pull ``--instance NAME`` (or ``--instance=NAME``) out of argv.
+
+    Accepting it anywhere is what makes ``autoduo --instance alice
+    status`` and ``autoduo status --instance alice`` both work.
+    """
+    rest: list[str] = []
+    name: str | None = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--instance":
+            if index + 1 >= len(argv):
+                raise ValueError("--instance needs a name")
+            name = argv[index + 1]
+            index += 2
+            continue
+        if token.startswith("--instance="):
+            name = token.split("=", 1)[1]
+            index += 1
+            continue
+        rest.append(token)
+        index += 1
+    return rest, name
+
+
+def _usage(prog: str) -> None:
+    ui.banner("autoduo")
+    ui.kv("usage", f"{prog} [--instance NAME] <command>", indent=0)
+    ui.line()
+    ui.heading("Commands")
+    ui.line()
+    for name, desc in COMMAND_HELP:
+        ui.line(f"    {ui.bold(f'{name:<10}')}  {desc}")
+    ui.line()
+    ui.note("Start with: sudo autoduo setup")
+    ui.line()
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+    global _ACTIVE_INSTANCE, _INSTANCE_EXPLICIT, _OPTS
+
+    try:
+        argv, instance_name = _split_instance(list(sys.argv[1:]))
+        _ACTIVE_INSTANCE = instances.resolve(
+            instance_name if instance_name is not None else instances.DEFAULT_NAME
+        )
+    except ValueError as exc:
+        ui.error(str(exc))
+        sys.exit(1)
+
+    _INSTANCE_EXPLICIT = instance_name is not None
+    _OPTS = {"all": "--all" in argv}
+    argv = [token for token in argv if token != "--all"]
+
+    if not argv or argv[0] not in COMMANDS:
         prog = pathlib.Path(sys.argv[0]).name
         if prog.endswith(".py"):
             prog = "autoduo"  # run as `python -m autoduo.cli`
-        ui.banner("autoduo")
-        ui.kv("usage", f"{prog} <command>", indent=0)
-        ui.line()
-        ui.heading("Commands")
-        ui.line()
-        for name, desc in COMMAND_HELP:
-            ui.line(f"    {ui.bold(f'{name:<10}')}  {desc}")
-        ui.line()
-        ui.note("Start with: sudo autoduo setup")
-        ui.line()
+        _usage(prog)
         sys.exit(1)
 
-    rc = COMMANDS[sys.argv[1]]()
+    rc = COMMANDS[argv[0]]()
     sys.exit(rc or 0)
 
 
