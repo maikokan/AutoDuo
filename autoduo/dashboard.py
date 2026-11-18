@@ -67,6 +67,10 @@ FALLBACK_COLUMNS = 80
 FALLBACK_LINES = 24
 INDENT = "  "
 QUIET_AFTER = 6 * 3600      # an older approval is quiet, not broken
+# The daemon emits a heartbeat every 300 s. Four missed beats is not a
+# quiet account, it is a loop that stopped turning while systemd still
+# reports the unit active -- the exact failure the audit could not see.
+STALLED_AFTER = 20 * 60
 MAX_INTERVAL = 60.0         # a sanity cap on the refresh argument
 
 _ENTER = "\033[?1049h\033[?25l"     # alternate screen, cursor hidden
@@ -108,6 +112,10 @@ def _green(stream: TextIO):
 
 def _green_bold(stream: TextIO):
     return lambda text: ui.duo_green(text, stream, strong=True)
+
+
+def _warn(stream: TextIO):
+    return lambda text: ui.paint(text, "warning", stream=stream)
 
 
 def _bold(stream: TextIO):
@@ -348,6 +356,16 @@ def _card(item: Any, width: int, stream: TextIO, now: datetime) -> list[str]:
               f"{_number(_attr(item, 'pending'))} pending")
     lines.append(_row(headline, counts, width, styles[kind], _dim(stream)))
     lines.append(_row(_event_line(item, now), "", width, _dim(stream)))
+
+    if state == "running":
+        silent = _seconds_since(_attr(item, "last_event_at"), now)
+        if silent is not None and silent > STALLED_AFTER:
+            # systemd says active; the log says nothing has happened. Say
+            # both, because "running" alone would be the lie.
+            lines.append(
+                _row(f"no event for {_humanise(silent).removesuffix(' ago')} · "
+                     "the loop may be stuck", "", width, _warn(stream))
+            )
 
     if state == "failed":
         lines.append(_row("stopped after an error, see the service log", "",
@@ -658,5 +676,8 @@ def run(statuses: Any, refresh: float = 1.0,
     if not _live(out):
         items, error = _snapshot(statuses)
         _write(out, _render(items, columns, out, error=error))
-        return 0
+        # A frame that could not read the host is not a healthy frame. An
+        # operator sees the line either way; a script gets a non-zero exit
+        # instead of the green it would otherwise be handed.
+        return 1 if error else 0
     return _live_loop(statuses, _interval(refresh), columns, out)

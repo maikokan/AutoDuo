@@ -288,13 +288,15 @@ def test_a_pipe_shows_every_account(monkeypatch):
 
 # --- failures --------------------------------------------------------------
 
-def test_a_raising_callable_prints_one_dim_line(monkeypatch):
+def test_a_raising_callable_prints_one_line_and_exits_nonzero(monkeypatch):
     def broken():
         raise RuntimeError("systemctl exploded")
 
     _env(monkeypatch)
     buf = io.StringIO()
-    assert dashboard.run(broken, stream=buf) == 0
+    # The line is for a person; the exit code is for a script. Silence plus
+    # exit 0 is the false-green this project keeps having to remove.
+    assert dashboard.run(broken, stream=buf) == 1
     lines = buf.getvalue().splitlines()
     text = "\n".join(_plain(lines))
     assert "RuntimeError" in text
@@ -309,7 +311,7 @@ def test_a_statuses_read_that_explodes_is_a_line(monkeypatch):
 
     _env(monkeypatch)
     buf = io.StringIO()
-    assert dashboard.run(broken, stream=buf) == 0
+    assert dashboard.run(broken, stream=buf) == 1
     assert "permission denied" in buf.getvalue()
 
 
@@ -444,3 +446,32 @@ def test_an_odd_refresh_is_clamped_not_fatal(monkeypatch):
     buf = io.StringIO()
     for value in (None, "often", float("nan"), -3, 10_000):
         assert dashboard.run([_row()], refresh=value, stream=buf) == 0
+
+
+# --- the loop that stopped without dying ----------------------------------
+
+def test_a_running_instance_with_a_stale_log_is_called_stuck(monkeypatch):
+    """systemd says active; the heartbeat says otherwise.
+
+    A hung poll loop is indistinguishable from a healthy one unless the
+    silence itself is reported, which is the whole point of the surface.
+    """
+    item = _row(last_event_at=_ago(minutes=40), last_approval_at=_ago(minutes=40))
+    lines = _frame([item], monkeypatch)
+    text = "\n".join(_plain(lines))
+    assert "running" in text
+    assert "no event for 40m" in text
+    assert "the loop may be stuck" in text
+    _fits(lines)
+
+
+def test_a_stopped_instance_is_allowed_to_be_silent(monkeypatch):
+    item = _row(state="stopped", last_event_at=_ago(days=3))
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "may be stuck" not in text
+
+
+def test_a_fresh_heartbeat_is_not_a_stall(monkeypatch):
+    item = _row(last_event_at=_ago(minutes=4))
+    text = "\n".join(_plain(_frame([item], monkeypatch)))
+    assert "may be stuck" not in text

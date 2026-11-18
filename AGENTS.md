@@ -150,20 +150,17 @@ and discarded) are **fixed**; they are recorded in `ROBUSTNESS.md`.
 4. **Error paths sleep twice** — `_note_poll_error()` sleeps the backoff
    and the outer `run()` loop then sleeps `poll_interval` on top, so a
    network error waits backoff + 5 s rather than the backoff it logged.
-5. **`autoduo watch` exits 0 when it cannot read statuses.** Piped mode
-   prints the error line and returns 0, so a script cannot tell a broken
-   dashboard from a quiet one. The live loop returns 0 too.
-6. **`.slim/deepwork/` is stale and gitignored.** It describes a `duo_bot/`
+5. **`.slim/deepwork/` is stale and gitignored.** It describes a `duo_bot/`
    package and `/var/lib/duo-bot/` paths, both since renamed to
    `autoduo/` and `/var/lib/autoduo/`. Useful for intent; not current
    fact. Never publish it.
-7. **Clock accuracy is functional.** `x-duo-date` is inside the signed
+6. **Clock accuracy is functional.** `x-duo-date` is inside the signed
    canonical string, so skewed time ⇒ auth failures. Both installers
    enable `systemd-timesyncd` for this reason.
-8. **The shipped unit uses `--no-passphrase`** — the vault is sealed with
+7. **The shipped unit uses `--no-passphrase`** — the vault is sealed with
    an empty passphrase and relies on filesystem permissions. Deliberate
    (documented in SECURITY.md) but it is the default posture.
-9. **`daemon.log` is created 0644; `audit.log` 0640.** Both live in a
+8. **`daemon.log` is created 0644; `audit.log` 0640.** Both live in a
    0750 directory, so neither is world-readable, but the difference is
    implicit rather than enforced — there is no `chmod` for `daemon.log`.
 
