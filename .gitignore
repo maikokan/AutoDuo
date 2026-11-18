@@ -66,3 +66,4 @@ heartbeat
 
 # Development (internal notes, never publish)
 .slim/
+.slim/deepwork/
