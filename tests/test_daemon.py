@@ -962,3 +962,95 @@ def test_an_unreadable_approval_response_parks_after_the_budget(
     ]
     assert classifications[-1] == "exhausted"
     assert d._is_seen("u1") is True  # parked, never retried
+
+
+# --- bookkeeping cannot kill the loop -------------------------------------
+
+def test_a_naive_timestamp_in_seen_json_does_not_kill_the_loop(
+        tmp_path, fake_clock, fake_sleep, log_capture
+):
+    """Reproduced before the fix: uncaught TypeError, then a restart loop.
+
+    `_evict_expired` runs outside the poll's try and compares a parsed
+    timestamp with an aware cutoff, so one offset-less entry was enough to
+    take the daemon down on every start.
+    """
+    clock, _ = fake_clock
+    state_path = tmp_path / "seen.json"
+    state_path.write_text(json.dumps({"u1": "2026-11-18T00:08:57.253959"}))
+
+    client = FakeDeviceClient()
+    d = _make_daemon(client, clock, fake_sleep[0], log_capture,
+                     state_path=state_path)
+    d._run_once()  # must not raise
+    assert client.list_calls == 1
+
+
+def test_a_non_string_timestamp_in_seen_json_is_evicted(
+        tmp_path, fake_clock, fake_sleep, log_capture
+):
+    clock, _ = fake_clock
+    state_path = tmp_path / "seen.json"
+    state_path.write_text(json.dumps({"u1": 1740000000}))
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture,
+                     state_path=state_path)
+    d._run_once()
+    assert "u1" not in d._seen
+
+
+def test_a_failing_eviction_is_logged_and_the_poll_still_happens(
+        fake_clock, fake_sleep, log_capture, monkeypatch
+):
+    clock, _ = fake_clock
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+    )
+    d = _make_daemon(client, clock, fake_sleep[0], log_capture)
+
+    def broken():
+        raise RuntimeError("eviction exploded")
+
+    monkeypatch.setattr(d, "_evict_expired", broken)
+    d._run_once()  # must not raise
+
+    events = _events(log_capture)
+    assert "loop_error" in events
+    assert "approve_ok" in events  # the product still worked
+    assert client.approved == ["u1"]
+
+
+def test_a_failing_heartbeat_is_logged_not_raised(fake_clock, fake_sleep,
+                                                  log_capture, monkeypatch):
+    clock, _ = fake_clock
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture)
+
+    def broken():
+        raise OSError("clock is a lie")
+
+    monkeypatch.setattr(d, "_maybe_heartbeat", broken)
+    d._run_once()
+    assert "loop_error" in _events(log_capture)
+
+
+def test_a_crash_in_run_is_recorded_and_exits_6(
+        fake_clock, fake_sleep, log_capture
+):
+    """A traceback in the journal is invisible to the dashboard.
+
+    ``Restart=always`` hides the crash from systemd folklore but not from
+    the person reading daemon.log, so the reason is written there and the
+    exit code says "try again" (5 would mean "another copy is running").
+    """
+    clock, _ = fake_clock
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture)
+
+    def boom():
+        raise RuntimeError("the loop died")
+
+    d.run = boom
+    assert daemon._run_guarded(d) == 6
+
+    line = [json.loads(l) for l in log_capture.getvalue().splitlines()
+            if "fatal_error" in l][0]
+    assert line["error_type"] == "RuntimeError"
+    assert "the loop died" in line["error"]

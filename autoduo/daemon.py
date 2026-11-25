@@ -169,10 +169,16 @@ class DuoBotDaemon:
             oldest_ts = self._seen[oldest_key]
             try:
                 ts = datetime.datetime.fromisoformat(oldest_ts)
-            except ValueError:
-                # Bad entry; evict.
+            except (TypeError, ValueError):
+                # Bad entry (unparseable, or not even a string); evict.
                 del self._seen[oldest_key]
                 continue
+            if ts.tzinfo is None:
+                # A hand-edited file or an older build. Comparing a naive
+                # datetime with an aware one raises TypeError, which used to
+                # escape this method and kill the loop on every restart.
+                # This daemon only ever means UTC.
+                ts = ts.replace(tzinfo=datetime.timezone.utc)
             if ts < cutoff:
                 del self._seen[oldest_key]
             else:
@@ -405,6 +411,27 @@ class DuoBotDaemon:
         )
         self._sleep(self._backoff_seconds)
 
+    def emit_fatal(self, exc: BaseException) -> None:
+        """Record a crash in the event log, where the dashboard can see it."""
+        self._emit(
+            "fatal_error",
+            error=repr(exc),
+            error_type=type(exc).__name__,
+        )
+
+    def _bookkeeping(self, where: str, work: Callable[[], None]) -> None:
+        """Run one piece of housekeeping without risking the loop.
+
+        Eviction, state saving and heartbeats are not the product. A fault
+        in any of them must cost one log line, not every future approval:
+        ``Restart=always`` would otherwise turn a corrupt file into a crash
+        loop whose only symptom is pushes nobody answers.
+        """
+        try:
+            work()
+        except Exception as e:  # noqa: BLE001 — housekeeping must not be fatal
+            self._emit("loop_error", where=where, error=repr(e))
+
     def _run_once(self) -> None:
         """Run a single poll-and-approve cycle.
 
@@ -418,7 +445,7 @@ class DuoBotDaemon:
             return
 
         had_auth_error = False
-        self._evict_expired()
+        self._bookkeeping("evict", self._evict_expired)
 
         # Poll.
         try:
@@ -454,12 +481,12 @@ class DuoBotDaemon:
             for tx in txs:
                 if self._approve_transaction(tx):
                     had_auth_error = True
-            self._maybe_save_state()
+            self._bookkeeping("save_state", self._maybe_save_state)
         else:
-            self._maybe_heartbeat()
+            self._bookkeeping("heartbeat", self._maybe_heartbeat)
 
         if not had_auth_error:
-            self._clear_auth_failures()
+            self._bookkeeping("clear_auth", self._clear_auth_failures)
 
     def _approve_transaction(self, tx: dict[str, Any]) -> bool:
         """Handle one transaction. Returns True if it caused an auth error."""
@@ -688,6 +715,24 @@ def _acquire_instance_lock(vault_path: str | pathlib.Path) -> int:
     )
 
 
+def _run_guarded(daemon_obj: "DuoBotDaemon") -> int:
+    """Run the loop and never let a traceback be the only record of a crash.
+
+    ``Restart=always`` means a crash is not silent to systemd, only to the
+    operator: the journal says ``Traceback`` and the dashboard says
+    ``running`` until the next restart. Writing ``fatal_error`` to the event
+    log puts the reason where it is already being read.
+    """
+    try:
+        return daemon_obj.run()
+    except Exception as e:  # noqa: BLE001 — last resort
+        logger.exception("daemon loop crashed")
+        daemon_obj.emit_fatal(e)
+        # 6, not 5: 5 is "another copy holds the lock" and the units are
+        # told not to restart it. A crash is worth another attempt.
+        return 6
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -745,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
         state_path=args.state_file,
         audit_log_stream=audit_stream,
     )
-    return daemon_obj.run()
+    return _run_guarded(daemon_obj)
 
 
 if __name__ == "__main__":
