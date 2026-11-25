@@ -1111,7 +1111,7 @@ def test_the_audit_record_carries_only_redacted_fields(
         "urgid": "u1",
         "txid": "t1",
         "factor": "duo_push",
-        "summary": "CUHK LOGIN",
+        "summary": "Example SSO",
         "type": "Login",
         "screen_text": "Approve login from 1.2.3.4?",
         "user_agent": "Mozilla/5.0 (secret)",
