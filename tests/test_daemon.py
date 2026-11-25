@@ -1054,3 +1054,110 @@ def test_a_crash_in_run_is_recorded_and_exits_6(
             if "fatal_error" in l][0]
     assert line["error_type"] == "RuntimeError"
     assert "the loop died" in line["error"]
+
+
+# --- one wait per cycle, not two (3.4) ------------------------------------
+
+def test_an_error_cycle_does_not_also_pay_the_poll_interval(
+        fake_clock, fake_sleep, log_capture
+):
+    """The log says backoff_seconds; run() used to add poll_interval on top.
+
+    So a 2 s backoff became 7 s of no polling, and the number printed was
+    not the number waited.
+    """
+    from autoduo.client import NetworkError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+
+    class Down(FakeDeviceClient):
+        def list_transactions(self):
+            raise NetworkError("connection reset")
+
+    d = _make_daemon(Down(), clock, sleep_fn, log_capture)
+    d._run_once()
+    assert d._waited_this_cycle is True
+    assert d._stop_event.is_set() is False
+
+
+def test_a_clean_cycle_leaves_the_poll_interval_to_run(
+        fake_clock, fake_sleep, log_capture
+):
+    clock, _ = fake_clock
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture)
+    d._run_once()
+    assert d._waited_this_cycle is False
+
+
+def test_the_circuit_open_branch_counts_as_the_cycle_wait(
+        fake_clock, fake_sleep, log_capture
+):
+    clock, _ = fake_clock
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture)
+    d._circuit_open_until = clock() + datetime.timedelta(seconds=300)
+    d._run_once()
+    assert d._waited_this_cycle is True
+
+
+# --- the audit payload goes through the redaction boundary ----------------
+
+def test_the_audit_record_carries_only_redacted_fields(
+        fake_clock, fake_sleep, log_capture
+):
+    """SECURITY.md promised this boundary; now it is the code that applies it."""
+    clock, _ = fake_clock
+    audit = io.StringIO()
+    tx = {
+        "urgid": "u1",
+        "txid": "t1",
+        "factor": "duo_push",
+        "summary": "CUHK LOGIN",
+        "type": "Login",
+        "screen_text": "Approve login from 1.2.3.4?",
+        "user_agent": "Mozilla/5.0 (secret)",
+        "attributes": {"user": "alice@example", "ip": "1.2.3.4"},
+        "ip": "1.2.3.4",
+    }
+    d = _make_daemon(
+        FakeDeviceClient(transactions_per_poll=[tx]), clock,
+        fake_sleep[0], log_capture, audit=audit,
+    )
+    d._run_once()
+
+    record = json.loads(audit.getvalue().strip())
+    assert set(record) == {
+        "ts", "event", "urgid", "txid", "factor", "app", "tx_type",
+    }
+    written = audit.getvalue()
+    assert "1.2.3.4" not in written
+    assert "alice@example" not in written
+    assert "Mozilla" not in written
+    assert "Approve login" not in written
+
+
+# --- a loose vault is reported --------------------------------------------
+
+def test_an_insecure_vault_mode_is_reported(tmp_path, fake_clock, fake_sleep,
+                                            log_capture):
+    clock, _ = fake_clock
+    vault_path = tmp_path / "vault.enc"
+    vault_path.write_text("v")
+    vault_path.chmod(0o644)
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture)
+
+    daemon._check_vault_mode(d, str(vault_path))
+
+    events = _events(log_capture)
+    assert "vault_mode_insecure" in events
+
+
+def test_a_private_vault_mode_is_quiet(tmp_path, fake_clock, fake_sleep,
+                                       log_capture):
+    clock, _ = fake_clock
+    vault_path = tmp_path / "vault.enc"
+    vault_path.write_text("v")
+    vault_path.chmod(0o600)
+    d = _make_daemon(FakeDeviceClient(), clock, fake_sleep[0], log_capture)
+
+    daemon._check_vault_mode(d, str(vault_path))
+    assert "vault_mode_insecure" not in _events(log_capture)

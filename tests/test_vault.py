@@ -5,7 +5,7 @@ Covers:
 - Wrong passphrase raises VaultError.
 - Tampered ciphertext raises VaultError (AES-GCM auth tag).
 - Tampered header (salt, nonce, version) raises VaultError.
-- Schema-version mismatch is detected (and migrate() hook is called).
+- Schema-version mismatch is detected and reported.
 - File permissions are 0600 / dir 0700 after init/seal.
 """
 import pathlib

@@ -37,7 +37,7 @@ import threading
 import time
 from typing import Any, Callable, TextIO
 
-from autoduo import vault
+from autoduo import redact, vault
 from autoduo.client import (
     ApprovalRejected,
     AuthError,
@@ -128,6 +128,8 @@ class DuoBotDaemon:
         self._last_heartbeat: datetime.datetime | None = None
         self._last_state_save: datetime.datetime | None = None
         self._last_approve: datetime.datetime | None = None
+        # Set by _backoff(); read by run() so a cycle waits once, not twice.
+        self._waited_this_cycle = False
 
         if state_path is not None:
             self._load_seen_state()
@@ -331,7 +333,7 @@ class DuoBotDaemon:
             consecutive=self._consecutive_network_errors,
             **fields,
         )
-        self._sleep(self._backoff_seconds)
+        self._backoff(self._backoff_seconds)
 
     # ------------------------------------------------------------------ run
 
@@ -409,7 +411,7 @@ class DuoBotDaemon:
             retry_in_seconds=self._backoff_seconds,
             **base,
         )
-        self._sleep(self._backoff_seconds)
+        self._backoff(self._backoff_seconds)
 
     def emit_fatal(self, exc: BaseException) -> None:
         """Record a crash in the event log, where the dashboard can see it."""
@@ -418,6 +420,21 @@ class DuoBotDaemon:
             error=repr(exc),
             error_type=type(exc).__name__,
         )
+
+    def emit_event(self, event: str, **fields: Any) -> None:
+        """Emit one operator-facing event (startup checks, notices)."""
+        self._emit(event, **fields)
+
+    def _backoff(self, seconds: float) -> None:
+        """Sleep once, and remember that this cycle already waited.
+
+        ``run()`` adds ``poll_interval`` after every cycle. Without this
+        flag an error path waited its backoff *and* the poll interval, so
+        the log said ``backoff_seconds: 2`` and the daemon actually waited
+        seven -- slower recovery than the number it printed.
+        """
+        self._waited_this_cycle = True
+        self._sleep(seconds)
 
     def _bookkeeping(self, where: str, work: Callable[[], None]) -> None:
         """Run one piece of housekeeping without risking the loop.
@@ -439,9 +456,10 @@ class DuoBotDaemon:
         between cycles. Tests can call this directly without setting up
         a signal handler.
         """
+        self._waited_this_cycle = False
         if self._circuit_is_open():
             # Sleep a fraction of the cooldown so we come back to check.
-            self._sleep(min(self._poll_interval, 5.0))
+            self._backoff(min(self._poll_interval, 5.0))
             return
 
         had_auth_error = False
@@ -454,7 +472,7 @@ class DuoBotDaemon:
             # 429 is rate limiting, not an auth failure: it must not feed
             # the credential-scoped circuit.
             self._emit("rate_limited", error=str(e))
-            self._sleep(self._poll_interval)
+            self._backoff(self._poll_interval)
             return
         except NetworkError as e:
             self._note_poll_error("network_error", error=str(e))
@@ -462,7 +480,7 @@ class DuoBotDaemon:
         except AuthError as e:
             self._record_auth_failure()
             self._emit("auth_error", error=str(e))
-            self._sleep(self._poll_interval)
+            self._backoff(self._poll_interval)
             return
         except ProtocolError as e:
             self._note_poll_error(
@@ -538,14 +556,19 @@ class DuoBotDaemon:
 
         self._approve_attempts.pop(urgid, None)
         self._emit("approve_ok", urgid=urgid, http=result.http_status)
-        # Audit log entry with redacted PII (separate, less-accessible log).
+        # The audit record is built from a redacted copy of the transaction:
+        # screen_text, user_agent and raw attributes are dropped and an IP
+        # is truncated. Today's field list is already safe, but the payload
+        # grows and SECURITY.md promises this boundary, so it is applied
+        # rather than assumed.
+        safe_tx = redact.redact_transaction(tx)
         self._emit_audit(
             "approved",
             urgid=urgid,
-            txid=tx.get("txid"),
-            factor=tx.get("factor"),
-            app=tx.get("summary"),
-            tx_type=tx.get("type"),
+            txid=safe_tx.get("txid"),
+            factor=safe_tx.get("factor"),
+            app=safe_tx.get("summary"),
+            tx_type=safe_tx.get("type"),
         )
         self._last_approve = self._clock()
         return False
@@ -581,7 +604,8 @@ class DuoBotDaemon:
                 self._emit("sighup_received", reopen=False)
             self._run_once()
             if not self._stop_requested and not self._stop_event.is_set():
-                self._sleep(self._poll_interval)
+                if not self._waited_this_cycle:
+                    self._sleep(self._poll_interval)
         self._save_seen_state()
         self._emit("daemon_stopped")
         return 0
@@ -657,7 +681,14 @@ def _open_log_stream(args: argparse.Namespace):
         return sys.stdout
     p = pathlib.Path(args.log_file)
     p.parent.mkdir(parents=True, exist_ok=True)
-    return p.open("a", buffering=1)  # line-buffered
+    stream = p.open("a", buffering=1)  # line-buffered
+    # The event log carries urgids and app names, so it is 0640 like the
+    # audit log rather than whatever the caller's umask happens to give.
+    try:
+        os.chmod(p, 0o640)
+    except OSError:
+        pass
+    return stream
 
 
 def _open_audit_stream(args: argparse.Namespace):
@@ -713,6 +744,22 @@ def _acquire_instance_lock(vault_path: str | pathlib.Path) -> int:
     return vault.acquire_instance_lock(
         vault_path, timeout=INSTANCE_LOCK_TIMEOUT_SECONDS
     )
+
+
+def _check_vault_mode(daemon_obj: "DuoBotDaemon", path: str) -> None:
+    """Say so when the vault is readable by someone other than its owner.
+
+    The vault is the only copy of the device key; with --no-passphrase the
+    file mode *is* the whole protection. open_vault cannot refuse a loose
+    file (an existing install would stop upgrading), but it must not be
+    silent about it either.
+    """
+    try:
+        mode = pathlib.Path(path).stat().st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        daemon_obj.emit_event("vault_mode_insecure", mode=oct(mode))
 
 
 def _run_guarded(daemon_obj: "DuoBotDaemon") -> int:
@@ -790,6 +837,7 @@ def main(argv: list[str] | None = None) -> int:
         state_path=args.state_file,
         audit_log_stream=audit_stream,
     )
+    _check_vault_mode(daemon_obj, args.vault)
     return _run_guarded(daemon_obj)
 
 

@@ -139,14 +139,14 @@ def test_ensure_dirs_uses_the_intended_modes(roots):
     vault_mode = stat.S_IMODE(paths.vault.parent.stat().st_mode)
     log_mode = stat.S_IMODE(paths.daemon_log.parent.stat().st_mode)
     assert vault_mode == 0o700
-    assert log_mode == 0o755
+    assert log_mode == 0o750
 
 
 def test_ensure_dirs_for_the_legacy_instance(roots):
     data, logs = roots
     instances.ensure_dirs(instances.resolve("default"))
     assert stat.S_IMODE(data.stat().st_mode) == 0o700
-    assert stat.S_IMODE(logs.stat().st_mode) == 0o755
+    assert stat.S_IMODE(logs.stat().st_mode) == 0o750
 
 
 def test_ensure_dirs_is_idempotent(roots):

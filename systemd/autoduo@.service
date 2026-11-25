@@ -11,6 +11,8 @@ StartLimitBurst=30
 
 [Service]
 Type=simple
+# Files 0640, directories 0750 unless something says otherwise.
+UMask=0027
 WorkingDirectory=/opt/autoduo
 
 # One vault, one state file and one log directory per instance. systemd

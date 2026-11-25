@@ -10,8 +10,9 @@ File format (little-endian, fixed-size header):
     40      12    AES-GCM nonce
     52      N     ciphertext (N = len(payload) + 16 GCM tag)
 
-The payload is JSON-encoded (UTF-8). Schema versioning lets us migrate
-later without breaking existing vaults.
+The payload is JSON-encoded (UTF-8). The schema version is carried in the
+header so a future on-disk format is refused with a clear message instead
+of looking like a wrong passphrase.
 
 Threat model: this file may be copied by an attacker. Without the
 passphrase, AES-GCM + 600k PBKDF2 rounds should resist offline brute
@@ -234,8 +235,3 @@ def open_vault(
         return json.loads(plaintext.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise VaultError("vault payload is not valid JSON") from e
-
-
-def migrate(payload: dict[str, Any]) -> dict[str, Any]:
-    """Hook for future schema migrations. No-op at v1."""
-    return payload

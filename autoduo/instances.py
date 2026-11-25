@@ -191,12 +191,14 @@ def _make_dir(path: pathlib.Path, mode: int) -> None:
 def ensure_dirs(paths: InstancePaths) -> None:
     """Create the instance's directories with their intended modes.
 
-    The vault directory is 0700 and the log directory 0755, matching what
-    the systemd units ask for. An existing directory is never re-chmodded
-    (it may be a caller's shared directory).
+    The vault directory is 0700 and the log directory 0750 — the same modes
+    both systemd units ask for (``StateDirectoryMode``/``LogsDirectoryMode``),
+    so the CLI and the unit cannot disagree about a directory one of them
+    created first. An existing directory is never re-chmodded (it may be a
+    caller's shared directory).
     """
     _make_dir(paths.vault.parent, 0o700)
-    _make_dir(paths.daemon_log.parent, 0o755)
+    _make_dir(paths.daemon_log.parent, 0o750)
 
 
 def clear_state_cache() -> None:
