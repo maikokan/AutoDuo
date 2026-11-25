@@ -347,31 +347,47 @@ class DuoBotDaemon:
         - anything else: retried under MAX_APPROVE_ATTEMPTS with backoff,
           then parked as terminal. No class opens the circuit by default.
         """
-        code = None if exc.code is None else str(exc.code)
+        self._classify_rejection(
+            urgid, exc.code, exc.message, "approve_rejected"
+        )
+
+    def _handle_protocol_error(self, urgid: str, exc: ProtocolError) -> None:
+        """A 2xx body we could not use: retry, then park.
+
+        We cannot tell whether the approval landed, so this is not terminal;
+        it is not a credential problem either, so it must not feed the
+        circuit. The per-urgid retry budget keeps a broken far end from
+        becoming an infinite loop.
+        """
+        self._classify_rejection(
+            urgid, exc.code, exc.message, "approve_protocol_error"
+        )
+
+    def _classify_rejection(
+        self, urgid: str, code: Any, message: str, event: str
+    ) -> None:
+        code = None if code is None else str(code)
         attempt = self._approve_attempts.get(urgid, 0) + 1
         self._approve_attempts[urgid] = attempt
-        base = {"urgid": urgid, "code": exc.code, "message": exc.message}
+        base = {"urgid": urgid, "code": code, "message": message}
 
         if code in TERMINAL_REJECTION_CODES:
             self._mark_terminal(urgid)
             self._approve_attempts.pop(urgid, None)
-            self._emit("approve_rejected", classification="terminal", **base)
+            self._emit(event, classification="terminal", **base)
             return
 
         if code in CIRCUIT_AUTH_CODES:
             self._unmark_seen(urgid)
             self._record_auth_failure()
-            self._emit("approve_rejected", classification="auth", **base)
+            self._emit(event, classification="auth", **base)
             return
 
         if attempt >= MAX_APPROVE_ATTEMPTS:
             self._mark_terminal(urgid)
             self._approve_attempts.pop(urgid, None)
             self._emit(
-                "approve_rejected",
-                classification="exhausted",
-                attempts=attempt,
-                **base,
+                event, classification="exhausted", attempts=attempt, **base
             )
             return
 
@@ -381,7 +397,7 @@ class DuoBotDaemon:
             DEFAULT_BACKOFF_CAP_SECONDS,
         )
         self._emit(
-            "approve_rejected",
+            event,
             classification="transient",
             attempt=attempt,
             retry_in_seconds=self._backoff_seconds,
@@ -473,6 +489,11 @@ class DuoBotDaemon:
             # Must precede the bare Exception handler: rejections have
             # their own retry/terminal policy.
             self._handle_rejection(urgid, e)
+            return False
+        except ProtocolError as e:
+            # A 2xx we could not read. Same budget as a transient
+            # rejection: unknown outcome, so retry and then park.
+            self._handle_protocol_error(urgid, e)
             return False
         except NetworkError as e:
             self._unmark_seen(urgid)

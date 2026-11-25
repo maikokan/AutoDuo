@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -35,6 +36,26 @@ def _sha256(data) -> str:
         return ""
     return hashlib.sha256(data).hexdigest()
 
+
+def _retry_after_seconds(value: str | None) -> float:
+    """A server-supplied wait, clamped to something a daemon can survive.
+
+    ``Retry-After`` is whatever the far end says, and it is not always a
+    sane number: a negative or NaN value makes ``time.sleep`` raise, and a
+    huge one stops the account approving for days with nothing in the log
+    but one line. Non-numeric values (an HTTP-date, per RFC 7231) fall back
+    to the default, and the result is bounded like our own backoff.
+    """
+    if not value:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_AFTER_SECONDS
+    if not math.isfinite(seconds) or seconds < 0:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    return min(seconds, RETRY_AFTER_CAP_SECONDS)
+
 ALLOWED_HOST_SUFFIX = ".duosecurity.com"
 
 # Retry policy
@@ -43,6 +64,10 @@ MAX_429_ATTEMPTS = 1  # one extra attempt after a Retry-After wait
 BACKOFF_BASE_SECONDS = 1.0
 BACKOFF_CAP_SECONDS = 60.0
 DEFAULT_RETRY_AFTER_SECONDS = 30.0
+# `Retry-After` is whatever the far end says. Without a ceiling a single
+# header stops this account approving for days, with one log line to show
+# for it, so it is bounded like our own backoff.
+RETRY_AFTER_CAP_SECONDS = 300.0
 DEFAULT_HTTP_TIMEOUT = 10.0
 
 
@@ -207,9 +232,22 @@ class DeviceClient:
         )
         try:
             body = resp.json()
-        except ValueError:
-            body = {}
-        if isinstance(body, dict) and "stat" in body and body["stat"] != "OK":
+        except ValueError as e:
+            # An HTTP 200 whose body is not JSON is not an approval. The
+            # same rule already applies to polls; a captive portal, a proxy
+            # error page or a Duo maintenance page used to be recorded here
+            # as a successful approval and written to the audit log.
+            raise ProtocolError(
+                f"approve: non-JSON response (status {resp.status_code})",
+                code="malformed",
+            ) from e
+        if not isinstance(body, dict):
+            raise ProtocolError(
+                "approve: unrecognised response body "
+                f"({type(body).__name__})",
+                code="malformed",
+            )
+        if "stat" in body and body["stat"] != "OK":
             raise ApprovalRejected(
                 str(body.get("message") or "approval rejected"),
                 code=body.get("code"),
@@ -245,7 +283,13 @@ class DeviceClient:
 
         self._log_traffic_request(method, req)
 
-        resp = self._session.send(req, timeout=self._http_timeout)
+        # Never follow a redirect. The host allowlist is checked once, in
+        # __init__, and requests would happily chase a 3xx to anywhere --
+        # carrying a signed request at a host nobody vetted and treating the
+        # stranger's body as Duo's answer.
+        resp = self._session.send(
+            req, timeout=self._http_timeout, allow_redirects=False
+        )
         self._log_traffic_response(method, req, resp)
         return resp
 
@@ -342,14 +386,20 @@ class DeviceClient:
                 attempts_429 += 1
                 if attempts_429 > MAX_429_ATTEMPTS:
                     raise RateLimitedError(f"429 after {attempts_429} attempts")
-                retry_after = resp.headers.get("Retry-After")
-                try:
-                    wait = float(retry_after) if retry_after else DEFAULT_RETRY_AFTER_SECONDS
-                except (TypeError, ValueError):
-                    wait = DEFAULT_RETRY_AFTER_SECONDS
+                wait = _retry_after_seconds(resp.headers.get("Retry-After"))
                 logger.warning("429 from %s %s; sleeping %.1fs", method, path, wait)
                 self._sleep(wait)
                 continue
+
+            if 300 <= status < 400:
+                # We asked not to be redirected; a 3xx still arriving means
+                # the far end is not the API we signed for.
+                raise ProtocolError(
+                    f"{method} {path}: redirected ({status}) to "
+                    f"{resp.headers.get('Location', 'no Location')!r}; "
+                    "refusing to follow",
+                    code="redirect",
+                )
 
             if 500 <= status < 600:
                 attempts_5xx += 1

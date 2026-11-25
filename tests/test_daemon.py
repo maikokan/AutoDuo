@@ -911,3 +911,54 @@ def test_an_already_private_state_file_is_left_alone(
     )
 
     assert "state_mode_tightened" not in log_capture.getvalue()
+
+
+def test_an_unreadable_approval_response_is_not_an_approval(
+    fake_clock, fake_sleep, log_capture
+):
+    """A 2xx body we cannot parse must not be recorded as a success.
+
+    It also must not be terminal: we do not know whether the approval
+    landed, so it gets the transient budget and then parks.
+    """
+    from autoduo.client import ProtocolError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    audit = io.StringIO()
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+        approve_raises=ProtocolError("non-JSON response", code="malformed"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture, audit=audit)
+    d._run_once()
+
+    events = _events(log_capture)
+    assert "approve_protocol_error" in events
+    assert "approve_ok" not in events
+    assert audit.getvalue() == ""
+    # Provisional seen mark is withdrawn, so the next poll retries it.
+    assert d._is_seen("u1") is False
+
+
+def test_an_unreadable_approval_response_parks_after_the_budget(
+    fake_clock, fake_sleep, log_capture
+):
+    from autoduo import daemon as dmod
+    from autoduo.client import ProtocolError
+    clock, _ = fake_clock
+    sleep_fn, _ = fake_sleep
+    client = FakeDeviceClient(
+        transactions_per_poll=[{"urgid": "u1"}],
+        approve_raises=ProtocolError("non-JSON response", code="malformed"),
+    )
+    d = _make_daemon(client, clock, sleep_fn, log_capture)
+    for _ in range(dmod.MAX_APPROVE_ATTEMPTS):
+        d._run_once()
+
+    classifications = [
+        json.loads(line)["classification"]
+        for line in log_capture.getvalue().splitlines()
+        if "approve_protocol_error" in line
+    ]
+    assert classifications[-1] == "exhausted"
+    assert d._is_seen("u1") is True  # parked, never retried

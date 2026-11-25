@@ -47,10 +47,13 @@ class MockTransport:
         resp = requests.Response()
         resp.status_code = status
         resp.headers.update(headers or {})
-        if body is not None:
-            resp._content = json.dumps(body).encode()
-        else:
+        if body is None:
             resp._content = b""
+        elif isinstance(body, (bytes, bytearray)):
+            # Raw wire bytes, so a test can send a body that is not JSON.
+            resp._content = bytes(body)
+        else:
+            resp._content = json.dumps(body).encode()
         return resp
 
 
@@ -478,3 +481,103 @@ def _mock_session(transport):
     session = MagicMock()
     session.send = transport
     return session
+
+# --- an HTTP 200 is not automatically a success ---------------------------
+
+def test_approve_rejects_a_non_json_200(device_client, monkeypatch):
+    """A captive portal or maintenance page must not look like an approval.
+
+    The poll path already refused a body it could not read; the approve
+    path did not, so an HTML 200 was emitted as ``approve_ok`` and written
+    to the audit log as a real approval.
+    """
+    transport = MockTransport([(200, {"Content-Type": "text/html"},
+                                b"<html>maintenance</html>")])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.approve("abc123")
+    assert ei.value.code == "malformed"
+
+
+def test_approve_rejects_a_json_body_that_is_not_an_object(
+        device_client, monkeypatch):
+    transport = MockTransport([(200, {}, ["not", "a", "dict"])])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError):
+        device_client.approve("abc123")
+
+
+# --- redirects are not followed -------------------------------------------
+
+def test_a_redirect_is_refused_not_followed(device_client, monkeypatch):
+    """The allowlist is checked once, at construction.
+
+    ``requests.Session.send`` follows redirects by default, so a 3xx from
+    anything answering on a Duo subdomain would carry the signed request
+    somewhere nobody vetted and hand back a stranger's body.
+    """
+    transport = MockTransport([(302, {"Location": "https://evil.example/"},
+                                b"")])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.approve("abc123")
+    assert ei.value.code == "redirect"
+    assert len(transport.calls) == 1  # no second request was made
+
+
+def test_the_client_asks_requests_not_to_follow(device_client, monkeypatch):
+    seen = {}
+
+    class Session:
+        def send(self, req, **kwargs):
+            seen.update(kwargs)
+            resp = requests.Response()
+            resp.status_code = 200
+            resp._content = b'{"stat": "OK"}'
+            return resp
+
+    monkeypatch.setattr(device_client, "_session", Session())
+    device_client.approve("abc123")
+    assert seen.get("allow_redirects") is False
+
+
+# --- Retry-After is clamped -----------------------------------------------
+
+@pytest.mark.parametrize("header,expected", [
+    ("999999", client.RETRY_AFTER_CAP_SECONDS),
+    ("-5", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("nan", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("inf", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("Wed, 21 Oct 2015 07:28:00 GMT", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("12", 12.0),
+])
+def test_retry_after_is_clamped_to_something_survivable(header, expected):
+    assert client._retry_after_seconds(header) == expected
+
+
+def test_a_huge_retry_after_does_not_stop_the_daemon_for_days(
+        device_client, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(device_client, "_sleep", lambda s: sleeps.append(s))
+    transport = MockTransport([
+        (429, {"Retry-After": "999999"}, b""),
+        (200, {}, {"stat": "OK"}),
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    device_client.approve("abc123")
+    assert sleeps == [client.RETRY_AFTER_CAP_SECONDS]
+    assert all(0 <= s <= client.RETRY_AFTER_CAP_SECONDS for s in sleeps)
+
+
+def test_a_negative_retry_after_never_reaches_time_sleep(
+        device_client, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(device_client, "_sleep", lambda s: sleeps.append(s))
+    transport = MockTransport([
+        (429, {"Retry-After": "-5"}, b""),
+        (200, {}, {"stat": "OK"}),
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    device_client.approve("abc123")
+    assert sleeps == [client.DEFAULT_RETRY_AFTER_SECONDS]
