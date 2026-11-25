@@ -25,6 +25,15 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
 
+      - name: Dependency sanity
+        run: pip check
+
+      - name: Import every module
+        # Catches a syntax or import error on a version the author does not
+        # run locally, before the test job spends minutes finding it.
+        run: |
+          python -c "import autoduo, autoduo.client, autoduo.daemon, autoduo.enroll, autoduo.protocol, autoduo.redact, autoduo.vault, autoduo.instances, autoduo.dashboard, autoduo.ui"
+
       - name: Run tests
         run: pytest tests/ -v
 
@@ -36,10 +45,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Shellcheck
+      - name: Install lint tools
         run: |
-          sudo apt-get install -y shellcheck
-          shellcheck scripts/autoduo scripts/install.sh scripts/uninstall.sh
+          sudo apt-get update
+          sudo apt-get install -y shellcheck logrotate systemd
+
+      - name: Shellcheck
+        # Every shell entry point, including the one-liner installer that
+        # the README tells people to curl.
+        run: |
+          shellcheck \
+            install.sh \
+            scripts/autoduo \
+            scripts/install.sh \
+            scripts/uninstall.sh
 
       - name: Compile-check
         run: |
@@ -47,5 +66,10 @@ jobs:
 
       - name: systemd-analyze verify
         run: |
-          sudo apt-get install -y systemd
-          systemd-analyze verify systemd/autoduo.service
+          systemd-analyze verify \
+            systemd/autoduo.service \
+            systemd/autoduo@.service
+
+      - name: Logrotate config parses
+        run: |
+          logrotate -d scripts/logrotate-autoduo
