@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from autoduo import protocol
 
-GOLDEN_KEY_PATH = pathlib.Path(__file__).parent / "_golden_key.pem"
+GOLDEN_KEY_PATH = pathlib.Path(__file__).parent / "fixtures" / "golden_test_key.pem"
 
 
 @pytest.fixture(scope="module")

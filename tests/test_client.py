@@ -60,7 +60,7 @@ class MockTransport:
 @pytest.fixture
 def golden_key_pem():
     from pathlib import Path
-    return Path(__file__).parent / "_golden_key.pem"
+    return Path(__file__).parent / "fixtures" / "golden_test_key.pem"
 
 
 @pytest.fixture
@@ -461,7 +461,7 @@ def test_signed_bytes_equal_transmitted_bytes_for_out_of_order_params(
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
     key = serialization.load_pem_private_key(
-        (pathlib.Path(__file__).parent / "_golden_key.pem").read_bytes(),
+        (pathlib.Path(__file__).parent / "fixtures" / "golden_test_key.pem").read_bytes(),
         password=None,
     )
     auth = req.headers["Authorization"]

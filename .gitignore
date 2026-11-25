@@ -42,6 +42,9 @@ data/
 
 # Secrets — never commit
 *.pem
+# ...except the test-only signing fixture, which is not a credential and
+# must stay stable for the golden vectors to mean anything.
+!tests/fixtures/golden_test_key.pem
 *.key
 *.enc
 vault.enc

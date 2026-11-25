@@ -66,6 +66,10 @@ jobs:
 
       - name: systemd-analyze verify
         run: |
+          # The unit names the deployed interpreter. Create that path so
+          # verify checks the unit rather than the runner's filesystem.
+          sudo mkdir -p /opt/autoduo/.venv/bin
+          sudo ln -sf "$(command -v python3)" /opt/autoduo/.venv/bin/python
           systemd-analyze verify \
             systemd/autoduo.service \
             systemd/autoduo@.service

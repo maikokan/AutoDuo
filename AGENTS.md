@@ -138,7 +138,8 @@ approved.
   `FakeDeviceClient` (daemon), `MockTransport` (client — replaces
   `requests.Session.send` with a programmable response queue), fake
   clock/sleep injection. `tests/test_protocol.py` locks the signing
-  format to golden vectors via `tests/_golden_key.pem`.
+  format to golden vectors via `tests/fixtures/golden_test_key.pem`
+  (a throwaway fixture; `.gitignore` makes one exception for it).
 - **House style** (CONTRIBUTING.md): Python 3.10+ syntax, type hints on
   public functions, tests for any new public behaviour, functions under
   ~50 lines, Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`).
