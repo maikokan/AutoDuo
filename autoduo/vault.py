@@ -10,8 +10,9 @@ File format (little-endian, fixed-size header):
     40      12    AES-GCM nonce
     52      N     ciphertext (N = len(payload) + 16 GCM tag)
 
-The payload is JSON-encoded (UTF-8). Schema versioning lets us migrate
-later without breaking existing vaults.
+The payload is JSON-encoded (UTF-8). The schema version is carried in the
+header so a future on-disk format is refused with a clear message instead
+of looking like a wrong passphrase.
 
 Threat model: this file may be copied by an attacker. Without the
 passphrase, AES-GCM + 600k PBKDF2 rounds should resist offline brute
@@ -20,10 +21,12 @@ plaintext. systemd LoadCredential is the recommended delivery channel.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import pathlib
-import stat
+import tempfile
+import time
 from typing import Any
 
 from cryptography.hazmat.primitives import hashes
@@ -36,6 +39,44 @@ PBKDF2_ITERATIONS = 600_000
 SALT_LEN = 32
 NONCE_LEN = 12
 KEY_LEN = 32  # AES-256
+
+# Single-instance lock: same file used by the daemon and by seal(). A
+# bounded wait keeps a stale daemon from failing a systemd start forever,
+# while still making two writers a hard error.
+LOCK_TIMEOUT_SECONDS = 1.0
+LOCK_POLL_SECONDS = 0.1
+
+
+def acquire_instance_lock(
+    path: str | pathlib.Path,
+    timeout: float = LOCK_TIMEOUT_SECONDS,
+) -> int:
+    """Take a bounded, exclusive flock beside `path`.
+
+    Returns a raw fd that the caller must hold for as long as it needs
+    mutual exclusion (closing it releases the lock). The lock file is
+    never unlinked: unlink+recreate defeats mutual exclusion because the
+    old inode stays locked while a new one is created. Raises OSError
+    (BlockingIOError after `timeout`) when the lock is held elsewhere.
+    """
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = p.with_name(p.name + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(LOCK_POLL_SECONDS)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class VaultError(Exception):
@@ -69,13 +110,19 @@ def seal(
     The file-level schema version is taken from `payload["v"]` so future
     versions can self-describe.
 
-    Sets parent dir to 0700 and file to 0600 regardless of caller umask.
-    Atomic via write-to-tmp + rename so a crash mid-write can't corrupt
-    an existing vault.
+    Creates the parent directory 0700 only when it did not already exist;
+    an existing parent's mode is left alone. The file is 0600 regardless of
+    caller umask. Atomic via write-to-tmp + rename so a crash mid-write
+    can't corrupt an existing vault.
     """
     p = pathlib.Path(path)
     parent = p.parent
+    created_parent = not parent.exists()
     parent.mkdir(parents=True, exist_ok=True)
+    # Tighten only a directory this call created. Never chmod a caller's
+    # shared directory (e.g. a group-readable log/data dir).
+    if created_parent:
+        os.chmod(parent, 0o700)
 
     if "v" not in payload:
         raise VaultError("payload must include 'v' (schema version)")
@@ -97,21 +144,48 @@ def seal(
     header = MAGIC + schema_version.to_bytes(4, "big")
     blob = header + salt + nonce + ciphertext
 
-    # Write atomically: tmp file in same dir, then rename.
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    # Atomic, durable write: unique 0600 temp file (mkstemp, not a fixed
+    # .tmp name — a crash leftover must not make future seals fail with
+    # EEXIST), fsync the file, replace, then fsync the directory. Without
+    # the directory fsync a power loss can leave a zero-length vault, and
+    # this file is the only copy of the device key.
+    #
+    # Same flock as the daemon: enrollment must not swap the vault under a
+    # running daemon.
     try:
-        tmp.write_bytes(blob)
-        os.rename(tmp, p)
-    except Exception:
-        # Clean up the temp file on failure
+        lock_fd = acquire_instance_lock(p)
+    except OSError as e:
+        raise VaultError(
+            "vault is locked by a running daemon; stop it before enrolling"
+        ) from e
+
+    tmp_name: str | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(parent), prefix=p.name + ".", suffix=".tmp"
+        )
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, p)
+        tmp_name = None
+        dir_fd = os.open(parent, os.O_RDONLY)
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        os.chmod(p, 0o600)
+    except Exception:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
         raise
-    # Enforce perms after write (replaces umask trick for thread-safety).
-    os.chmod(p, 0o600)
-    os.chmod(parent, 0o700)
+    finally:
+        os.close(lock_fd)
 
 
 def open_vault(
@@ -161,8 +235,3 @@ def open_vault(
         return json.loads(plaintext.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise VaultError("vault payload is not valid JSON") from e
-
-
-def migrate(payload: dict[str, Any]) -> dict[str, Any]:
-    """Hook for future schema migrations. No-op at v1."""
-    return payload

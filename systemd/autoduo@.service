@@ -1,0 +1,63 @@
+[Unit]
+Description=autoduo: headless Duo auto-accept daemon (instance %i)
+Documentation=file:///opt/autoduo/README.md
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# Instances are independent processes. A second copy of *this* instance
+# exits 5 (lock held) and must not be able to exhaust the start limit of
+# the copy that is actually running.
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+# Files 0640, directories 0750 unless something says otherwise.
+UMask=0027
+WorkingDirectory=/opt/autoduo
+
+# One vault, one state file and one log directory per instance. systemd
+# creates them with the right modes and ownership, so nothing has to
+# guess a path or race a mkdir at startup.
+StateDirectory=autoduo/instances/%i
+StateDirectoryMode=0700
+LogsDirectory=autoduo/%i
+LogsDirectoryMode=0750
+
+ExecStart=/opt/autoduo/.venv/bin/python -m autoduo.daemon \
+    --vault /var/lib/autoduo/instances/%i/vault.enc \
+    --no-passphrase \
+    --state-file /var/lib/autoduo/instances/%i/seen.json \
+    --audit-log /var/log/autoduo/%i/audit.log \
+    --log-file /var/log/autoduo/%i/daemon.log \
+    --poll-interval 5 \
+    --push-ttl 60
+
+Restart=always
+RestartSec=5
+# 5 = another copy of this instance holds the lock. Restarting cannot
+# help, and a restart storm would mask the instance that works.
+RestartPreventExitStatus=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autoduo-%i
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ReadWritePaths=/var/log/autoduo /var/lib/autoduo /opt/autoduo
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

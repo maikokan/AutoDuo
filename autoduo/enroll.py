@@ -53,15 +53,15 @@ def _normalize_activation_url(url: str) -> tuple[str, str]:
     2. https://api-XXXXXXXX.duosecurity.com/push/v2/activation/CODE
        (programmatic, host uses `api-` prefix, path is `/push/v2/activation/`)
 
-    The `/push/v2/activation/` endpoint expects a FULL composite activation
-    code of the form `{SHORT_CODE}-{base64(API_HOST)}`. The `m-` portal
-    URL only contains the SHORT_CODE; we must construct the full code
-    by base64-encoding the API host and appending it.
+    Both carry the *short* activation code. The `m-` portal host is
+    rewritten to its `api-` sibling, and the code is posted unchanged to
+    `/push/v2/activation/{code}`; the code is not composed with the host.
+    (This docstring used to claim a composite `{SHORT_CODE}-{base64(HOST)}`
+    form, which the implementation has never produced.)
 
     Returns (host, code) suitable for a POST to
     `https://{host}/push/v2/activation/{code}`.
     """
-    import base64 as b64
     from urllib.parse import urlparse
 
     parsed = urlparse(url.strip())

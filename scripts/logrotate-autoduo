@@ -11,6 +11,31 @@
     # new file descriptor after copytruncate copies the old file.
 }
 
+# Named accounts keep their logs in /var/log/autoduo/<name>/. The two
+# blocks below cover that layout; without them an instance's daemon.log
+# grows forever, which for the audit log is a disk-fill risk.
+/var/log/autoduo/*/daemon.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    create 0640 root root
+}
+
+/var/log/autoduo/*/audit.log {
+    monthly
+    rotate 12
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    create 0640 root root
+}
+
 /var/log/autoduo/audit.log {
     monthly
     rotate 12

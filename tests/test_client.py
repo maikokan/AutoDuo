@@ -14,6 +14,7 @@ hit the network. Asserts:
 """
 import base64
 import json
+import pathlib
 import time
 import urllib.parse
 from unittest.mock import MagicMock
@@ -21,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
-from autoduo import client
+from autoduo import client, protocol
 
 
 # --- Mock transport --------------------------------------------------------
@@ -46,17 +47,20 @@ class MockTransport:
         resp = requests.Response()
         resp.status_code = status
         resp.headers.update(headers or {})
-        if body is not None:
-            resp._content = json.dumps(body).encode()
-        else:
+        if body is None:
             resp._content = b""
+        elif isinstance(body, (bytes, bytearray)):
+            # Raw wire bytes, so a test can send a body that is not JSON.
+            resp._content = bytes(body)
+        else:
+            resp._content = json.dumps(body).encode()
         return resp
 
 
 @pytest.fixture
 def golden_key_pem():
     from pathlib import Path
-    return Path(__file__).parent / "_golden_key.pem"
+    return Path(__file__).parent / "fixtures" / "golden_test_key.pem"
 
 
 @pytest.fixture
@@ -135,7 +139,7 @@ def test_urgid_url_quoted(golden_key_pem, monkeypatch):
             self.calls.append(request)
             resp = requests.Response()
             resp.status_code = 200
-            resp._content = b'{"response": "OK"}'
+            resp._content = b'{"stat": "OK", "response": "OK"}'
             return resp
 
     cap = Capture()
@@ -148,7 +152,7 @@ def test_urgid_url_quoted(golden_key_pem, monkeypatch):
 # --- list_transactions -----------------------------------------------------
 
 def test_list_transactions_returns_parsed_json(device_client, monkeypatch):
-    transport = MockTransport([(200, {}, {"response": [{"urgid": "u1"}, {"urgid": "u2"}]})])
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": [{"urgid": "u1"}, {"urgid": "u2"}]})])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     txs = device_client.list_transactions()
     assert len(txs) == 2
@@ -236,7 +240,7 @@ def test_list_transactions_signs_with_canonical_string(golden_key_pem, monkeypat
 # --- approve ---------------------------------------------------------------
 
 def test_approve_posts_answer_approve_to_urgid_url(device_client, monkeypatch):
-    transport = MockTransport([(200, {}, {"response": "OK"})])
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": "OK"})])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     result = device_client.approve("abc123")
     req = transport.calls[0]
@@ -250,11 +254,11 @@ def test_approve_posts_answer_approve_to_urgid_url(device_client, monkeypatch):
 
 
 def test_approve_returns_approve_result(device_client, monkeypatch):
-    transport = MockTransport([(200, {}, {"response": "OK"})])
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": "OK"})])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     result = device_client.approve("abc123")
     assert result.http_status == 200
-    assert result.body == {"response": "OK"}
+    assert result.body == {"stat": "OK", "response": "OK"}
 
 
 # --- Retry / backoff branches ---------------------------------------------
@@ -265,7 +269,7 @@ def test_429_uses_retry_after(device_client, monkeypatch):
     # 429 with Retry-After, then 200.
     transport = MockTransport([
         (429, {"Retry-After": "7"}, None),
-        (200, {}, {"response": []}),
+        (200, {}, {"stat": "OK", "response": []}),
     ])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     device_client.list_transactions()
@@ -291,7 +295,7 @@ def test_5xx_triggers_exponential_backoff(device_client, monkeypatch):
     transport = MockTransport([
         (503, {}, None),
         (503, {}, None),
-        (200, {}, {"response": []}),
+        (200, {}, {"stat": "OK", "response": []}),
     ])
     monkeypatch.setattr(device_client, "_session", _mock_session(transport))
     device_client.list_transactions()
@@ -346,6 +350,130 @@ def test_network_error_triggers_retry(device_client, monkeypatch):
     assert len(sleeps) >= 1
 
 
+# --- Protocol validation (ROBUSTNESS 1.1 / 1.2) ----------------------------
+
+def test_list_transactions_raises_on_stat_fail(device_client, monkeypatch):
+    transport = MockTransport([
+        (200, {}, {"stat": "FAIL", "code": 40301, "message": "no akey"})
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.list_transactions()
+    assert ei.value.code == 40301
+    assert ei.value.message == "no akey"
+
+
+def test_list_transactions_stat_fail_beats_usable_response(device_client, monkeypatch):
+    """A FAIL body with something that looks like a transaction list is
+    still a failure — checking shape first would swallow it."""
+    transport = MockTransport([
+        (200, {}, {"stat": "FAIL", "code": 1, "response": [{"urgid": "u1"}]})
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError):
+        device_client.list_transactions()
+
+
+def test_list_transactions_raises_on_ok_without_transactions(device_client, monkeypatch):
+    transport = MockTransport([(200, {}, {"stat": "OK"})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.list_transactions()
+    assert ei.value.code == "malformed"
+
+
+def test_list_transactions_accepts_missing_stat_legacy_shape(
+    device_client, monkeypatch
+):
+    """stat absent must keep polling: old bodies/fakes omit it."""
+    transport = MockTransport([(200, {}, {"response": [{"urgid": "u1"}]})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    assert device_client.list_transactions() == [{"urgid": "u1"}]
+
+
+def test_list_transactions_raises_on_non_json_body(device_client, monkeypatch):
+    transport = MockTransport([(200, {}, None)])  # empty body -> ValueError
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError):
+        device_client.list_transactions()
+
+
+def test_list_transactions_accepts_bare_list(device_client, monkeypatch):
+    """A bare list cannot carry stat=FAIL; accept it as the tx list."""
+    transport = MockTransport([(200, {}, [{"urgid": "u1"}])])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    assert device_client.list_transactions() == [{"urgid": "u1"}]
+
+
+def test_approve_raises_on_stat_fail(device_client, monkeypatch):
+    transport = MockTransport([
+        (200, {}, {"stat": "FAIL", "code": "40032", "message": "step-up"})
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ApprovalRejected) as ei:
+        device_client.approve("abc123")
+    assert ei.value.code == "40032"
+    assert ei.value.message == "step-up"
+
+
+def test_approve_accepts_body_without_stat(device_client, monkeypatch):
+    """Legacy/partial bodies omit stat; only a present non-OK stat fails."""
+    transport = MockTransport([(200, {}, {"response": "OK"})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    result = device_client.approve("abc123")
+    assert result.http_status == 200
+
+
+def test_signed_bytes_equal_transmitted_bytes_for_out_of_order_params(
+    device_client, monkeypatch
+):
+    """canonical_request signs sorted(params); the wire must carry the same
+    order and encoding (ROBUSTNESS 1.3 coupling)."""
+    transport = MockTransport([(200, {}, {"stat": "OK", "response": []})])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+
+    device_client._signed_request(
+        "POST",
+        "/push/v2/device/transactions/abc123",
+        {"zeta": "1", "alpha": "2"},  # deliberately not sorted
+    )
+
+    req = transport.calls[0]
+    body = req.body
+    if isinstance(body, bytes):
+        body = body.decode()
+    # Transmitted as sorted key/value pairs, form-encoded (Content-Type set).
+    assert body == "alpha=2&zeta=1"
+    assert req.headers["Content-Type"].startswith(
+        "application/x-www-form-urlencoded"
+    )
+
+    pairs = urllib.parse.parse_qsl(body)
+    assert pairs == [("alpha", "2"), ("zeta", "1")]
+    canon = protocol.canonical_request(
+        req.headers["x-duo-date"], req.method, device_client.host,
+        "/push/v2/device/transactions/abc123", dict(pairs),
+    )
+    # The final canonical line is exactly the bytes on the wire.
+    assert canon.rsplit("\n", 1)[1] == body
+
+    # And the signature verifies over that canonical string.
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    key = serialization.load_pem_private_key(
+        (pathlib.Path(__file__).parent / "fixtures" / "golden_test_key.pem").read_bytes(),
+        password=None,
+    )
+    auth = req.headers["Authorization"]
+    sig_b64 = base64.b64decode(auth.split(" ", 1)[1]).decode().split(":", 1)[1]
+    key.public_key().verify(
+        base64.b64decode(sig_b64),
+        canon.encode("ascii"),
+        padding.PKCS1v15(),
+        hashes.SHA512(),
+    )
+
+
 # --- helpers ---------------------------------------------------------------
 
 def _mock_session(transport):
@@ -353,3 +481,103 @@ def _mock_session(transport):
     session = MagicMock()
     session.send = transport
     return session
+
+# --- an HTTP 200 is not automatically a success ---------------------------
+
+def test_approve_rejects_a_non_json_200(device_client, monkeypatch):
+    """A captive portal or maintenance page must not look like an approval.
+
+    The poll path already refused a body it could not read; the approve
+    path did not, so an HTML 200 was emitted as ``approve_ok`` and written
+    to the audit log as a real approval.
+    """
+    transport = MockTransport([(200, {"Content-Type": "text/html"},
+                                b"<html>maintenance</html>")])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.approve("abc123")
+    assert ei.value.code == "malformed"
+
+
+def test_approve_rejects_a_json_body_that_is_not_an_object(
+        device_client, monkeypatch):
+    transport = MockTransport([(200, {}, ["not", "a", "dict"])])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError):
+        device_client.approve("abc123")
+
+
+# --- redirects are not followed -------------------------------------------
+
+def test_a_redirect_is_refused_not_followed(device_client, monkeypatch):
+    """The allowlist is checked once, at construction.
+
+    ``requests.Session.send`` follows redirects by default, so a 3xx from
+    anything answering on a Duo subdomain would carry the signed request
+    somewhere nobody vetted and hand back a stranger's body.
+    """
+    transport = MockTransport([(302, {"Location": "https://evil.example/"},
+                                b"")])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    with pytest.raises(client.ProtocolError) as ei:
+        device_client.approve("abc123")
+    assert ei.value.code == "redirect"
+    assert len(transport.calls) == 1  # no second request was made
+
+
+def test_the_client_asks_requests_not_to_follow(device_client, monkeypatch):
+    seen = {}
+
+    class Session:
+        def send(self, req, **kwargs):
+            seen.update(kwargs)
+            resp = requests.Response()
+            resp.status_code = 200
+            resp._content = b'{"stat": "OK"}'
+            return resp
+
+    monkeypatch.setattr(device_client, "_session", Session())
+    device_client.approve("abc123")
+    assert seen.get("allow_redirects") is False
+
+
+# --- Retry-After is clamped -----------------------------------------------
+
+@pytest.mark.parametrize("header,expected", [
+    ("999999", client.RETRY_AFTER_CAP_SECONDS),
+    ("-5", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("nan", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("inf", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("Wed, 21 Oct 2015 07:28:00 GMT", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("", client.DEFAULT_RETRY_AFTER_SECONDS),
+    ("12", 12.0),
+])
+def test_retry_after_is_clamped_to_something_survivable(header, expected):
+    assert client._retry_after_seconds(header) == expected
+
+
+def test_a_huge_retry_after_does_not_stop_the_daemon_for_days(
+        device_client, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(device_client, "_sleep", lambda s: sleeps.append(s))
+    transport = MockTransport([
+        (429, {"Retry-After": "999999"}, b""),
+        (200, {}, {"stat": "OK"}),
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    device_client.approve("abc123")
+    assert sleeps == [client.RETRY_AFTER_CAP_SECONDS]
+    assert all(0 <= s <= client.RETRY_AFTER_CAP_SECONDS for s in sleeps)
+
+
+def test_a_negative_retry_after_never_reaches_time_sleep(
+        device_client, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(device_client, "_sleep", lambda s: sleeps.append(s))
+    transport = MockTransport([
+        (429, {"Retry-After": "-5"}, b""),
+        (200, {}, {"stat": "OK"}),
+    ])
+    monkeypatch.setattr(device_client, "_session", _mock_session(transport))
+    device_client.approve("abc123")
+    assert sleeps == [client.DEFAULT_RETRY_AFTER_SECONDS]
