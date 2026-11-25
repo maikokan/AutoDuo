@@ -1,62 +1,84 @@
 # Contributing
 
-Thanks for your interest in autoduo.
+Thanks for looking. This is a small project and it's easy to get a change in.
 
-## Setup
+## Getting set up
 
 ```bash
 git clone https://github.com/maikokan/AutoDuo.git
-cd autoduo
+cd AutoDuo
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
-
-For development with testing tools:
-
-```bash
 .venv/bin/pip install -r requirements-dev.txt
 ```
 
-## Running tests
+`requirements-dev.txt` pulls in `requirements.txt` plus pytest and bandit.
+
+## Tests
 
 ```bash
-.venv/bin/pytest tests/ -v
+.venv/bin/python -m pytest tests/ -v
 ```
 
-Tests are pure unit tests with no network access. Mocks for the Duo
-HTTP endpoints live in `tests/test_client.py`.
+They run offline and take about fifteen seconds. Everything that would touch
+the network is faked: `MockTransport` in `tests/test_client.py` replaces
+`requests.Session.send` with a queue of canned responses, and the daemon
+tests pass in a fake clock, a fake sleep and a `FakeDeviceClient`.
 
-## Code style
+Please don't add a test that makes a real request. If you need a new response
+shape, extend the mock.
 
-- Python 3.10+ syntax (we test on 3.10, 3.11, 3.12).
+`tests/fixtures/golden_test_key.pem` is a throwaway key that exists only to
+pin the request-signing format. Don't replace it — the golden vectors stop
+meaning anything if the key changes.
+
+## Before you open a pull request
+
+These are the same checks CI runs, and they're quick:
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+.venv/bin/bandit -r autoduo/ -ll
+python3 -m compileall autoduo/
+shellcheck install.sh scripts/autoduo scripts/install.sh scripts/uninstall.sh
+systemd-analyze verify systemd/autoduo.service systemd/autoduo@.service
+logrotate -d scripts/logrotate-autoduo
+```
+
+## Style
+
+- Python 3.10+, because that's the oldest version in the test matrix.
 - Type hints on public functions.
-- Tests for any new public function or behavior.
-- Keep functions small; refactor when they grow past ~50 lines.
+- A test for any new public behaviour. If it fixes a bug, the test should
+  fail on the old code — that's how we know it's the right test.
+- Keep functions under about fifty lines. Past that, pull a helper out.
+- Dependencies are `requests` and `cryptography`. Anything else needs a
+  conversation first, not a pull request.
 
 ## Commit messages
 
-Use [Conventional Commits](https://www.conventionalcommits.org/):
+[Conventional Commits](https://www.conventionalcommits.org/), with the body
+saying why rather than restating the diff:
 
 ```
-feat: add audit-log PII redaction
-fix: handle empty transaction list
-docs: clarify Verified Push limitation
-test: add circuit-breaker cooldown test
+feat: add per-instance units
+fix: treat a non-JSON 200 as an error, not an approval
+docs: explain why the clock matters
+test: cover the redirect refusal
 ```
 
-## Filing issues
+## Reporting bugs
 
-When filing an issue, please include:
-- autoduo version (`autoduo --version`)
-- Output of `systemctl status autoduo` if relevant
-- Relevant log entries from `/var/log/autoduo/daemon.log`
-  (NEVER paste authorization headers or full activation URLs)
+An issue is fine for anything that isn't a security problem. Include:
 
-## Reporting security issues
+- the version (`autoduo version`)
+- `systemctl status autoduo` if it's about the service
+- the relevant lines from `/var/log/autoduo/daemon.log`
 
-See [SECURITY.md](SECURITY.md). Do not file security issues publicly.
+Never paste authorization headers, full activation URLs, or the vault.
+
+For security problems, see [SECURITY.md](SECURITY.md) and use a private
+advisory instead of a public issue.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed
-under the MIT License (see [LICENSE](LICENSE)).
+Contributions are MIT, same as the project. See [LICENSE](LICENSE).
