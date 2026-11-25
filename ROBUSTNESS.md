@@ -1,39 +1,34 @@
-# Robustness audit & improvement roadmap
+# Robustness audit
 
-*2026-11-18 · baseline: `main` @ ff477bf · 114 tests passing · revised after review*
+*Started 2026-11-18 against `main` @ ff477bf. Extended on 2026-11-25 for 0.2.0.*
 
-> **Status.** Wave A is implemented on top of this baseline: 1.1, 1.2, 2.1,
-> 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 3.1, 3.3 and 4.1 are done, 161 tests pass, and
-> `bandit -r autoduo/ -ll` reports no issues. Still open: 1.3 (needs the
-> live-tenant measurement), 3.2, 3.4, 3.5, 4.2–4.6. Two things this audit
-> predicted were confirmed on the live host: `audit.log` did not exist, and
-> `/var/lib/autoduo` was 0755.
->
-> The audit's 1.3 risk is **latent, not active**: of 215 approvals logged on
-> the production tenant, every urgid appears exactly twice — one `tx_seen`,
-> one `approve_ok` — so the minimal `answer=approve` payload with no `txId`
-> header was accepted every time. The divergence is still worth closing, but
-> it is not the cause of a broken deployment.
+This started with one observation: the daemon had a failure mode it could not
+see. It looked healthy while approving nothing, and nothing anywhere said
+otherwise. This is the record of finding that, plus the second pass that found
+four more in the HTTP client and the installer.
 
-This is an audit of how AutoDuo fails, not a feature wishlist. Every item was
-verified by reading the code, and the load-bearing ones were reproduced with
-a probe whose output is quoted below. Where a claim depends on Duo's server
-behaviour it is marked **VERIFY**, with the experiment that settles it.
+It is not a feature list. Every item was checked by reading the code, and the
+ones that mattered were reproduced with a probe whose output is quoted below.
+Where a claim depends on Duo's own behaviour it is marked **VERIFY**, with the
+experiment that settles it. The reference for what the protocol actually
+requires is the open-source [DuoBreak](https://github.com/JesseNaser/DuoBreak)
+client (v2.0.0), which speaks the same device protocol against a live tenant.
 
-The reference for "what the protocol actually requires" is the open-source
-[DuoBreak](https://github.com/JesseNaser/DuoBreak) client (v2.0.0), which
-speaks the same device protocol against a live tenant.
+**Where it stands in 0.2.0.** 311 tests, bandit clean, and a live tenant that
+has now been measured rather than assumed: 229 approvals, every push seen
+exactly twice, 14 of them with a matching audit record after that log was
+finally wired. What is still open is small — a real `WatchdogSec`, the
+`seen.json` ordering assumption, a client dry-run, and clock skew. Everything
+else below is history, kept because the reasoning is still the reasoning.
 
-**Revision note.** A first draft of this audit mis-diagnosed the Verified Push
-failure (it cannot trip the circuit breaker — see 3.1), claimed no test
-exercises `main()` (one does — see 4.1), and under-ranked the poll path.
-Those are corrected here.
+**Revision note.** The first draft mis-diagnosed the Verified Push failure (it
+cannot trip the circuit breaker — see 3.1), claimed no test exercises `main()`
+(one does — see 4.1), and under-ranked the poll path. Those are corrected
+here. The 1.3 evidence has been updated as the tenant accumulated approvals.
 
-## Status after Wave A
+## Status
 
-Everything in this table is verified against the code, not intended. The rest
-of the document is left as written — it is the record of why each change was
-made, and the reasoning is still the reasoning.
+Everything in this table was checked against the code, not against intent.
 
 | Item | State |
 |---|---|

@@ -1,11 +1,13 @@
-# 🚨 AutoDuo
+# AutoDuo
 
-**⚠️ WARNING: This software defeats Duo 2FA by design.**
+**AutoDuo defeats Duo 2FA, on purpose.** If that sentence makes you
+uncomfortable, this is the wrong tool and no amount of configuration will
+fix it.
 
-AutoDuo is a headless Linux daemon that runs 24/7 and automatically
-approves Duo push notifications on your behalf. After a one-time
-enrollment (scan QR / approve on phone once), it handles all future
-push approvals unattended.
+It is a small daemon for Linux. You enrol it once, the same way you would
+enrol a phone, and from then on it answers your Duo push prompts for you.
+It runs under systemd, looks for new pushes every five seconds, and approves
+them. After setup you don't touch your phone again.
 
 [![tests](https://github.com/maikokan/AutoDuo/actions/workflows/test.yml/badge.svg)](https://github.com/maikokan/AutoDuo/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -13,32 +15,37 @@ push approvals unattended.
 
 ---
 
-## ⚠️ Threat Model — Read First
+## Before you install
 
-AutoDuo **defeats the entire purpose of Duo 2FA**. Anyone with shell
-on this server can approve pushes for the configured account. Use **only**
-on a dedicated VPS that you fully control. You must:
+Approving a push is the one thing Duo asks a human to do. AutoDuo hands that
+job to a process on a server, so from then on your second factor is only as
+strong as your access to that server. Anyone who can log in as root can read
+the vault and approve a login in your name. That is the trade. There is no
+version of this that avoids it.
 
-- Run SSH-key-only auth (`PermitRootLogin no`)
-- Keep the host patched
-- Disable Verified Duo Push for the account (if enforced, the login will
-  fail even after approval)
-- Accept that Duo may detect and disable the account (anomaly detection)
+So put it on a machine you own, that nobody else uses:
 
-By using this software, you accept all responsibility for the security
-consequences. The authors accept no liability.
+- SSH keys only, and no root password login.
+- Keep the box patched. It is now part of your authentication path.
+- If your tenant enforces Verified Duo Push, the approval will go through and
+  the login will still fail — Duo wants a human to type a code from the
+  browser into the phone, and a daemon can't do that.
+- Duo may notice the pattern and disable the device. That is their call, and
+  they are not wrong to make it.
+
+If any of that is not acceptable, don't install it.
 
 ---
 
-## Quick Start
+## Install
 
-**One-liner install** (copy and paste):
+One command, on a fresh Debian or Ubuntu box:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maikokan/AutoDuo/main/install.sh | sudo bash
 ```
 
-**Or install manually:**
+Or do it yourself:
 
 ```bash
 git clone https://github.com/maikokan/AutoDuo.git /opt/autoduo
@@ -46,29 +53,33 @@ cd /opt/autoduo
 sudo scripts/autoduo setup
 ```
 
-AutoDuo installs to `/opt/autoduo/` with vault at `/var/lib/autoduo/`
-and logs at `/var/log/autoduo/`. `setup` enrolls the account, then enables
-and starts the unit, so it comes back after a reboot.
+The installer puts the code in `/opt/autoduo`, the vault in
+`/var/lib/autoduo` and the logs in `/var/log/autoduo`. `setup` is the part
+that matters: it shows the warning, takes your activation URL, enrols the
+device, asks you to approve the new device on your phone once, then enables
+and starts the service. Enabling matters — an unenabled unit disappears at
+the first reboot and takes your approvals with it.
 
-Current release: **0.2.0** — see [CHANGELOG.md](CHANGELOG.md) for what
-changed, including the multi-account layout and the fixes that came out of
-the [robustness audit](ROBUSTNESS.md).
+The current release is 0.2.0. [CHANGELOG.md](CHANGELOG.md) says what changed,
+and [ROBUSTNESS.md](ROBUSTNESS.md) has the audit behind the fixes if you want
+to see the reasoning rather than the result.
 
 ---
 
-## Multiple accounts
+## More than one account
 
-Duo enrolls one device per user, so each account is its own **instance**:
-its own vault, state file, log directory and systemd unit. Two accounts are
-two processes and neither can affect the other.
+Duo enrols one device per user, so a second account means a second full
+install. AutoDuo calls each one an instance: its own vault, its own state
+file, its own logs, its own systemd unit. Two accounts are two processes, and
+neither can read or disturb the other's data.
 
 ```bash
-sudo autoduo setup --instance alice     # enrol, enable and start
-sudo autoduo instances                  # what is configured, and its state
+sudo autoduo setup --instance alice     # enrol it, enable it, start it
+sudo autoduo instances                  # what is set up, and how it's doing
 sudo autoduo watch                      # live view of every instance
 ```
 
-Each named instance lives in its own directories:
+Each named instance gets its own directories:
 
 | | |
 |---|---|
@@ -77,98 +88,113 @@ Each named instance lives in its own directories:
 | logs | `/var/log/autoduo/<name>/{daemon,audit}.log` |
 | unit | `autoduo@<name>.service` |
 
-An instance called `default` uses the original paths
-(`/var/lib/autoduo/vault.enc`), so an existing install needs no migration.
-A second copy of the same instance refuses to start and exits 5 rather than
-approving pushes twice.
+The instance called `default` keeps the original paths
+(`/var/lib/autoduo/vault.enc`), which is why an install from 0.1.0 keeps
+working without being migrated.
+
+If you start a second copy of the same instance it notices the lock, exits 5,
+and systemd leaves it alone instead of restarting it forever. Two copies
+approving the same push twice is not a failure mode anyone wants.
 
 ---
 
 ## Commands
 
 ```
-autoduo setup       Interactive setup with disclaimer (first run)
-autoduo install     Install systemd service (no disclaimer, for scripts)
-autoduo uninstall   Remove one instance (--all removes everything)
-autoduo enroll      One-shot enroll with a Duo activation URL
-autoduo start       Start the daemon
-autoduo stop        Stop the daemon
-autoduo restart     Restart the daemon
-autoduo status      Show daemon status
-autoduo logs        Tail live logs (Ctrl+C to stop)
-autoduo instances   List every instance and its state
-autoduo watch       Live dashboard of all instances
-autoduo version     Print version
+autoduo setup       set up an account: warning, enrol, enable, start
+autoduo install     install the service without the interactive parts
+autoduo uninstall   remove one instance (--all removes everything)
+autoduo enroll      enrol with an activation URL, without starting anything
+autoduo start       start the daemon
+autoduo stop        stop the daemon
+autoduo restart     restart the daemon
+autoduo status      what systemd thinks, plus the recent log
+autoduo logs        tail the journal (Ctrl+C to stop)
+autoduo instances   every instance and its state
+autoduo watch       the live dashboard
+autoduo version     print the version
 ```
 
-Every command takes `--instance NAME` (before or after the verb) and
-defaults to `default`. All commands require root (`sudo`).
+Every command takes `--instance NAME`, before or after the verb, and defaults
+to `default`. All of them need root.
 
 ---
 
-## How It Works
+## What it does
 
-When you try to log in to something protected by Duo, Duo sends a
-push notification to your phone asking "Approve?". AutoDuo replaces
-that phone — it sees the push and approves it for you automatically.
+When something asks you to log in through Duo, Duo sends a push to the phone
+you enrolled. AutoDuo is that phone. It sees the push, approves it, and the
+login continues.
 
-On first run, AutoDuo enrolls itself as a "Duo Mobile device" using
-the same protocol the real Duo Mobile Android app uses. After that, it
-polls for pending push requests every 5 seconds and approves them.
+There is no browser automation and no scraping. During setup it registers
+itself as a Duo Mobile device using the same endpoints the real Android app
+uses, which is why it works at all. After that it is a signed HTTP poll, five
+seconds apart, and a signed "approve" for each push it hasn't seen before.
 
-No browser automation. No screen scraping. No cookies. Just the same
-API calls the real app makes.
+One thing worth knowing if you watch the log: a push is marked seen before the
+approve call goes out, so the next poll five seconds later doesn't approve the
+same one again. If the call fails in a way that's worth retrying, the mark is
+withdrawn on purpose. If the process is killed mid-approval, the push may get
+approved twice; Duo answers the second attempt with "already answered" and the
+daemon parks it. When Duo rejects an approval, it sorts the push into one of
+three buckets — terminal, auth problem, or worth retrying — and only retries
+the last kind, a bounded number of times.
 
 ---
 
-## Logging
+## Logs
 
-| Log | What it contains |
+| File | What's in it |
 |---|---|
-| `/var/log/autoduo/daemon.log` | Events, lifecycle, approval success/failure |
-| `/var/log/autoduo/audit.log` | Redacted approval records (urgid, app, factor) |
-| `/var/log/autoduo/traffic.log` | HTTP traffic (opt-in, headers redacted, body SHA-256 only) |
+| `/var/log/autoduo/daemon.log` | What the daemon did: start, stop, polls, approvals, errors |
+| `/var/log/autoduo/audit.log` | One line per approval, with the personal data stripped |
+| `/var/log/autoduo/traffic.log` | HTTP metadata, only if you turn it on |
 
-A named instance keeps its logs in `/var/log/autoduo/<name>/`. Sensitive
-fields (`akey`, `pkey`, authorization headers) are never logged in full. Both
-log files are mode 0640 in a 0750 directory, and `/etc/logrotate.d/autoduo`
-rotates the legacy and per-instance layouts (the daemon uses `copytruncate`,
-so a rotation needs no restart).
+A named instance writes to `/var/log/autoduo/<name>/`. The `akey`, the
+`pkey` and the `Authorization` header never appear in any log in full. The
+logs are 0640 in a 0750 directory, and `/etc/logrotate.d/autoduo` rotates
+both the old flat layout and the per-instance one. Rotation uses
+`copytruncate`, so a rotation does not interrupt the daemon.
 
-The approval audit log is built from a redacted copy of the Duo
-transaction: `screen_text`, `user_agent` and raw attributes are dropped and
-an IP is truncated, so a record names the account and app without carrying
-the login's personal data.
+The audit record is built from a redacted copy of the transaction: screen
+text, user agent and raw attributes are dropped, and an IP is truncated. You
+get the app and the fact of the approval, not who logged in from where.
 
 ---
 
 ## Requirements
 
-- **OS:** Ubuntu 22.04+ / Debian 12+ (systemd required)
-- **Python:** 3.10, 3.11, or 3.12
-- **RAM:** ~30 MB resident
-- **Disk:** ~50 MB (venv + vault + logs)
+- Debian 12 or Ubuntu 22.04 and later, with systemd
+- Python 3.10, 3.11 or 3.12
+- About 30 MB of RAM, and 50 MB of disk for the venv, vault and logs
+
+Clock accuracy is not cosmetic. The request signature includes the date
+header, so a server whose clock drifts a few minutes starts failing
+authentication. The installer enables `systemd-timesyncd` for exactly this
+reason.
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Tests run offline, on three Python
+versions, and a pull request is welcome.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md).
+See [SECURITY.md](SECURITY.md). Please report problems privately, not in a
+public issue.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 ---
 
 ## Disclaimer
 
-This software is provided "AS IS", without warranty of any kind, express
-or implied. **The authors accept no liability** for any damage, account
-loss, security breach, or other consequence of using this software.
-You are solely responsible for the security of your systems. Use at your
-own risk. There is no warranty of fitness for any particular purpose.
+This software comes with no warranty, express or implied. If it approves
+something you didn't want approved, locks you out, gets your account
+suspended, or makes a bad day worse, that is yours to carry, not the
+authors'. You are responsible for the machine it runs on. Use it on systems
+you own and understand.
