@@ -32,16 +32,20 @@ Scale: ~2,100 lines of Python in 8 modules, 2 runtime deps (`requests`,
 .venv/bin/python -m autoduo.enroll --help
 .venv/bin/python -m autoduo.daemon --help
 
-# Full CI parity (all four run in .github/workflows/test.yml)
+# Full CI parity (all of `.github/workflows/test.yml`)
 .venv/bin/python -m pytest tests/ -v
 .venv/bin/bandit -r autoduo/ -ll
+.venv/bin/python -c "import autoduo, autoduo.client, autoduo.daemon, autoduo.enroll, autoduo.protocol, autoduo.redact, autoduo.vault, autoduo.instances, autoduo.dashboard, autoduo.ui"
 python3 -m compileall autoduo/
-shellcheck scripts/autoduo scripts/install.sh scripts/uninstall.sh install.sh
+shellcheck install.sh scripts/autoduo scripts/install.sh scripts/uninstall.sh
 systemd-analyze verify systemd/autoduo.service systemd/autoduo@.service
+logrotate -d scripts/logrotate-autoduo
 ```
 
-CI runs pytest + bandit on Python 3.10, 3.11, 3.12, plus a lint job for
-shellcheck, compileall and `systemd-analyze verify`.
+CI runs pytest + bandit + an import smoke test on Python 3.10, 3.11, 3.12,
+plus a lint job for shellcheck (every script, including `install.sh`),
+compileall, `systemd-analyze verify` (both units) and a `logrotate -d`
+parse of the rotation config.
 
 ## Architecture
 
@@ -77,10 +81,20 @@ shellcheck, compileall and `systemd-analyze verify`.
    `ApprovalRejected`, which is classified as terminal (parked, never
    retried), auth-class (allowlist, feeds the circuit), or transient
    (retried up to `MAX_APPROVE_ATTEMPTS`, then parked).
-6. Errors branch on type: `AuthError` and auth-class rejections → circuit
+6. An approval whose 2xx body cannot be read (not JSON, not an object) or
+   whose response is a 3xx raises `ProtocolError` and gets the same bounded
+   retry-then-park treatment: we cannot know whether it landed, so it is
+   neither a success nor a credential failure.
+7. Errors branch on type: `AuthError` and auth-class rejections → circuit
    breaker (≥5 in 300 s → 5 min cooldown), `NetworkError` → exponential
    backoff (base 1 s, cap 60 s), `RateLimitedError` → its own backoff and
-   **not** the circuit.
+   **not** the circuit. `Retry-After` is clamped to 0–300 s.
+8. `run()` sleeps once per cycle: a cycle that already backed off sets
+   `_waited_this_cycle`, so the loop does not add `poll_interval` on top.
+9. Housekeeping (eviction, state save, heartbeat, auth clearing) runs
+   through `_bookkeeping`, which logs `loop_error` and continues. A crash
+   that escapes anyway is written as `fatal_error` and exits 6 — 5 is
+   reserved for "another copy holds the lock", which systemd must not retry.
 
 ### Instance layout
 
@@ -132,49 +146,47 @@ approved.
 ## Known gaps — verified, not speculation
 
 These are real mismatches between code and docs. Check whether a fix has
-landed before acting on them. Items 1 and 2 of the original audit
-(`autoduo install` copying a directory, and the audit stream being opened
-and discarded) are **fixed**; they are recorded in `ROBUSTNESS.md`.
+landed before acting on them. The first audit's findings are all closed and
+recorded in `ROBUSTNESS.md`; what remains is smaller.
 
-1. **`redact.redact_transaction()` is dead code** — never called by the
-   daemon. SECURITY.md claims PII is stripped "via redact_transaction()
-   before logging"; it isn't. The audit fields written today are safe by
-   construction, so this is a doc bug unless the audit payload grows.
-2. **`vault.migrate()` has no caller.** `open_vault` hard-fails on a
-   schema version mismatch. The migration hook is a placeholder, so a
-   future `DVB1` → `DVB2` bump would strand every existing vault.
-3. **Contradictory docstrings in `enroll.py`.** `_normalize_activation_url`
-   claims the endpoint wants a composite `{SHORT_CODE}-{base64(API_HOST)}`
-   code; the code it actually returns, and `_post_activation` posts, is
-   the short code. The implemented path is `/activate/CODE` → short code.
-4. **Error paths sleep twice** — `_note_poll_error()` sleeps the backoff
-   and the outer `run()` loop then sleeps `poll_interval` on top, so a
-   network error waits backoff + 5 s rather than the backoff it logged.
-5. **`.slim/deepwork/` is stale and gitignored.** It describes a `duo_bot/`
+1. **`.slim/deepwork/` is stale and gitignored.** It describes a `duo_bot/`
    package and `/var/lib/duo-bot/` paths, both since renamed to
    `autoduo/` and `/var/lib/autoduo/`. Useful for intent; not current
    fact. Never publish it.
-6. **Clock accuracy is functional.** `x-duo-date` is inside the signed
+2. **Clock accuracy is functional.** `x-duo-date` is inside the signed
    canonical string, so skewed time ⇒ auth failures. Both installers
    enable `systemd-timesyncd` for this reason.
-7. **The shipped unit uses `--no-passphrase`** — the vault is sealed with
+3. **The shipped unit uses `--no-passphrase`** — the vault is sealed with
    an empty passphrase and relies on filesystem permissions. Deliberate
-   (documented in SECURITY.md) but it is the default posture.
-8. **`daemon.log` is created 0644; `audit.log` 0640.** Both live in a
-   0750 directory, so neither is world-readable, but the difference is
-   implicit rather than enforced — there is no `chmod` for `daemon.log`.
+   (documented in SECURITY.md) but it is the default posture. A loose vault
+   is at least reported now (`vault_mode_insecure`).
+4. **`_evict_expired` assumes `seen.json` is in chronological order** and
+   stops at the first unexpired entry. Every writer preserves that order, so
+   it holds today; a hand-edited file only keeps stale dedup keys longer
+   than the TTL, which cannot skip a real push. Do not rely on the order
+   for anything else.
+5. **A `Retry-After` HTTP-date is ignored** — the parser accepts seconds
+   only and falls back to 30 s for a date, which is a safe default but not
+   the value the server asked for.
+6. **The dashboard's live mode needs a TTY and `NO_COLOR` unset.** With
+   `NO_COLOR` on a terminal it prints one frame and exits 0, by design; a
+   script cannot ask for N frames.
 
 ## Paths
 
 - This checkout is `/opt/duo-bot`, but every deployed path assumes
   `/opt/autoduo`. `cli.py` derives `REPO_DIR` from `__file__`;
   `scripts/autoduo`, `scripts/install.sh` and `systemd/autoduo.service`
-  hardcode `/opt/autoduo`.
+  hardcode `/opt/autoduo`. On this host `/opt/autoduo` is a symlink to the
+  checkout.
 - Runtime data: vault `/var/lib/autoduo/vault.enc`, state
   `/var/lib/autoduo/seen.json`, logs `/var/log/autoduo/` (instance
   `default`); a named instance uses
   `/var/lib/autoduo/instances/<name>/` and `/var/log/autoduo/<name>/`.
   `autoduo.instances.resolve(name)` is the only place that decides this.
+- The lock file beside a vault is `<vault>.lock` — in practice
+  `vault.enc.lock`, not the `vault.lock` that older notes mention.
+  `InstancePaths.actual_lock` returns the real one.
 - `scripts/install.sh` defaults `REPO_DIR=/opt/autoduo`; export
   `REPO_DIR` to point it at a checkout elsewhere.
 

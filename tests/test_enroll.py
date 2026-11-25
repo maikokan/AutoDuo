@@ -244,4 +244,7 @@ def test_help_exits_cleanly():
 
 def test_version_via_module():
     import autoduo
-    assert autoduo.__version__ == "0.1.0"
+    assert autoduo.__version__ == "0.2.0"
+    # The changelog must name the version the code reports.
+    changelog = pathlib.Path(__file__).parent.parent / "CHANGELOG.md"
+    assert f"## [{autoduo.__version__}]" in changelog.read_text()

@@ -47,7 +47,12 @@ sudo scripts/autoduo setup
 ```
 
 AutoDuo installs to `/opt/autoduo/` with vault at `/var/lib/autoduo/`
-and logs at `/var/log/autoduo/`.
+and logs at `/var/log/autoduo/`. `setup` enrolls the account, then enables
+and starts the unit, so it comes back after a reboot.
+
+Current release: **0.2.0** — see [CHANGELOG.md](CHANGELOG.md) for what
+changed, including the multi-account layout and the fixes that came out of
+the [robustness audit](ROBUSTNESS.md).
 
 ---
 
@@ -58,8 +63,7 @@ its own vault, state file, log directory and systemd unit. Two accounts are
 two processes and neither can affect the other.
 
 ```bash
-sudo autoduo setup --instance alice     # enrol, write the unit, start
-sudo systemctl enable --now autoduo@alice
+sudo autoduo setup --instance alice     # enrol, enable and start
 sudo autoduo instances                  # what is configured, and its state
 sudo autoduo watch                      # live view of every instance
 ```
@@ -126,8 +130,15 @@ API calls the real app makes.
 | `/var/log/autoduo/traffic.log` | HTTP traffic (opt-in, headers redacted, body SHA-256 only) |
 
 A named instance keeps its logs in `/var/log/autoduo/<name>/`. Sensitive
-fields (`akey`, `pkey`, authorization headers) are never logged in full. The
-audit log is mode 0640 and its directory 0750.
+fields (`akey`, `pkey`, authorization headers) are never logged in full. Both
+log files are mode 0640 in a 0750 directory, and `/etc/logrotate.d/autoduo`
+rotates the legacy and per-instance layouts (the daemon uses `copytruncate`,
+so a rotation needs no restart).
+
+The approval audit log is built from a redacted copy of the Duo
+transaction: `screen_text`, `user_agent` and raw attributes are dropped and
+an IP is truncated, so a record names the account and app without carrying
+the login's personal data.
 
 ---
 

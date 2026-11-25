@@ -641,3 +641,26 @@ def test_status_of_an_unenrolled_instance_fails_loudly(temp_instances, monkeypat
     monkeypatch.setattr(cli, "_ACTIVE_INSTANCE", instances.resolve("alice"))
 
     assert cli.cmd_status() == 1
+
+
+def test_setup_enables_the_unit_so_a_reboot_does_not_silence_it(
+    temp_instances, monkeypatch
+):
+    """Starting is not enough: an unenabled unit is gone after a reboot.
+
+    The old setup flow called `systemctl start` only, so the first reboot
+    left the account unapproved with nothing running to say why.
+    """
+    monkeypatch.setattr(cli, "_ensure_root", lambda: None)
+    monkeypatch.setattr(cli, "_ACTIVE_INSTANCE", instances.resolve("alice"))
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    cli._enable_and_start()
+
+    assert calls[0] == ["systemctl", "enable", "autoduo@alice"]
+    assert calls[1] == ["systemctl", "start", "autoduo@alice"]

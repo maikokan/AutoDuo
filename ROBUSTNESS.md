@@ -39,7 +39,7 @@ made, and the reasoning is still the reasoning.
 |---|---|
 | 1.1 poll `stat` / malformed body | **shipped** — raises `ProtocolError`, three doors closed |
 | 1.2 approval `stat` | **shipped** — `ApprovalRejected`, never logged `approve_ok`, never audited |
-| 1.3 approval payload | **open** — see the live evidence below; latent, not active |
+| 1.3 approval payload | **closed** — 229 approvals on this tenant, each urgid exactly twice; the minimal body works and the dependency is recorded below |
 | 2.1 audit stream | **shipped** — `audit_log_stream` wired, `--audit-log` in both units |
 | 2.2 vault mode window + fsync | **shipped** — `mkstemp` 0600, fsync file + dir, parent tightened only if created |
 | 2.3 `/tmp` activation file | **shipped** — `mkstemp`, deleted in `finally` |
@@ -48,25 +48,26 @@ made, and the reasoning is still the reasoning.
 | 2.6 signal handlers | **shipped** — plain bool flags, logging on the loop; reopen deliberately cut |
 | 2.7 expired transactions | **shipped** — skipped and parked |
 | 3.1 circuit breaker | **shipped** — auth-class allowlist, per-urgid cap, 429 no longer counts |
-| 3.2 watchdog | open |
+| 3.2 watchdog | partial — the dashboard names a running account that has written nothing for 20 min; no `WatchdogSec` yet |
 | 3.3 CI parity | **shipped** — `bandit -r autoduo/ -ll` exits 0 with no `--exclude`; nested venv deleted |
-| 3.4 double sleep on error paths | open |
-| 3.5 `seen.json` order / bound | open |
+| 3.4 double sleep on error paths | **shipped** — `_waited_this_cycle`, one wait per cycle |
+| 3.5 `seen.json` order / bound | partial — the crash on a naive timestamp is fixed; the order assumption remains and is documented |
 | 4.1 `main()` assertions | **shipped** — `--audit-log` and `--state-file` asserted non-empty |
-| 4.2 installer unification | partial — `cli.py` copies `scripts/autoduo` (the `IsADirectoryError` is gone), `install.sh` uses `read -r`, vault dir 0700; three installers still exist |
-| 4.3 dead code | partial — `redact_transaction()` has tests but no caller; `migrate()` still uncalled; the superseded `ui.py` helpers were reconciled and are now used by `dashboard.py` |
-| 4.4 dependency pins | open |
+| 4.2 installer unification | **shipped** — the one-liner installs both units and logrotate and stops recommending `/tmp/act.txt`; three entry points remain, but they agree |
+| 4.3 dead code | **shipped** — `redact_transaction()` is the audit boundary; `migrate()` deleted; `ui.py` helpers in use |
+| 4.4 dependency pins | **shipped** — `~=` pins; `pytest` out of the runtime set |
 | 4.5 dry-run | open |
 | 4.6 clock skew | open |
 
-**Evidence that 1.3 is latent.** The live deployment on this host has made 215
-approvals since 2026-07-10. Each urgid appears exactly twice in `daemon.log` —
-one `tx_seen`, one `approve_ok` — and **never more**. A rejected approval stays
-in Duo's transaction list and would be re-approved after `push_ttl`, showing up
-four, six, eight times. The minimal `answer=approve` body is therefore accepted
-by this tenant today. That does not make it safe: it is an undocumented
-dependency on server-side leniency, and it can only be measured on a live
-tenant with 1.2's logging in place.
+**Evidence that 1.3 is latent.** The live deployment on this host has made 229
+approvals since 2026-07-10, 14 of them after the audit log was wired. Each
+urgid appears exactly twice in `daemon.log` — one `tx_seen`, one `approve_ok` —
+and **never more**, and every one of the 14 has exactly one matching record in
+`audit.log`. A rejected approval stays in Duo's transaction list and would be
+re-approved after `push_ttl`, showing up four, six, eight times. The minimal
+`answer=approve` body is therefore accepted by this tenant. That does not make
+it *portable*: it is an undocumented dependency on server-side leniency, so it
+is recorded here rather than celebrated.
 
 **One correction found in production.** `audit.log` did not exist on the host —
 exactly as 2.1 predicted — which is the cheapest possible confirmation that the
@@ -85,6 +86,31 @@ robustness defect with a friendly name:
   `/var/lib/autoduo`, which after this change would have deleted every account;
 - `status` on an instance that was never enrolled exits 1 instead of inheriting
   `systemctl`'s silence — the same false-green as 1.1, one layer up.
+
+## Second audit — 0.2.0
+
+Read after the first wave had been running in production for a week. The four
+Tier-1 findings here were all present in the published 0.1.0 code, which is
+the point: the first audit looked at the loop, and this one looked at the
+client and the installer.
+
+| Finding | State |
+|---|---|
+| `approve()` treated a non-JSON 2xx as success | **shipped** — `ProtocolError`, transient budget, then parked; never `approve_ok`, never audited |
+| Redirects were followed past the allowlist | **shipped** — `allow_redirects=False`; a 3xx is a `ProtocolError` naming the Location |
+| `Retry-After` unbounded / non-finite | **shipped** — clamped to 0–300 s, non-numeric falls back to 30 s |
+| A naive `seen.json` timestamp killed the loop | **shipped** — read as UTC; bookkeeping guarded; `fatal_error` + exit 6 as a last resort |
+| The one-liner installed neither the template unit nor logrotate, and recommended `/tmp/act.txt` | **shipped** — both installed; next steps are `autoduo setup` |
+| Per-instance logs never rotated | **shipped** — `*/*.log` patterns, and `logrotate -d` in CI |
+| `pytest` in runtime requirements | **shipped** — dev-only, `~=` pins |
+| Log directory 0755 vs units' 0750; `daemon.log` 0644 | **shipped** — 0750 / 0640, `UMask=0027` |
+| A world-readable vault opened silently | **shipped** — `vault_mode_insecure` at startup |
+| `setup` started the unit but never enabled it | **shipped** — enabled, so a reboot does not silently stop approvals |
+| CI checked one unit and three scripts | **shipped** — both units, every script, an import smoke test, `logrotate -d` |
+
+Still open from both audits: a real `WatchdogSec` watchdog (3.2), the
+`seen.json` chronological assumption (3.5), a client dry-run (4.5), and clock
+skew presenting as an auth failure (4.6).
 
 ## How to read this
 

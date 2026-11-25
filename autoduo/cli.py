@@ -301,7 +301,8 @@ def cmd_setup():
 
     ui.line()
     ui.step(4, "Start the daemon")
-    cmd_start()
+    _enable_and_start()
+    ui.ok(f"Instance {paths.name} is running and enabled at boot.")
 
     return _push_test_gate()
 
@@ -514,6 +515,17 @@ def cmd_uninstall():
         "kept; autoduo uninstall --all removes them."
     )
     return 0
+
+
+def _enable_and_start() -> None:
+    """Start the unit now *and* after a reboot.
+
+    ``setup`` used to start the daemon without enabling it, so the first
+    reboot left the account silently unapproved with nothing running to
+    say why. Enabling is part of "it works", not a separate preference.
+    """
+    _run(["systemctl", "enable", _unit()])
+    _run(["systemctl", "start", _unit()])
 
 
 def cmd_start():
