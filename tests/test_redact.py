@@ -141,7 +141,7 @@ def test_redact_transaction_keeps_safe_fields():
         "urgid": "abc",
         "txid": "tx-123",
         "factor": "push",
-        "app": "CUHK LOGIN",
+        "app": "Example SSO",
         "type": "Login",
     }
     out = redact.redact_transaction(tx)
